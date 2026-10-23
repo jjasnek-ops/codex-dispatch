@@ -29,6 +29,14 @@ check_task_completion() {
         return
     fi
 
+    # Interactive notifications may not carry the runner exit code. Respect
+    # an explicit failure contract in the final message instead of turning it
+    # into a false done state.
+    if echo "$output" | grep -Eqi '(Task failed|任务失败|status["[:space:]]*[=:][[:space:]]*(failed|error)|exit[_ -]?code["[:space:]]*[=:][[:space:]]*[1-9]|退出码[：:][[:space:]]*[1-9])'; then
+        echo "failed"
+        return
+    fi
+
     if echo "$output" | grep -qE "(Interrupted.*What should Codex do|请指示如何继续|用户是否希望我：|AskUserQuestion)"; then
         echo "waiting_input"
         return
