@@ -18,6 +18,16 @@ log() { echo "[$(date -Iseconds)] $*" >> "$LOG"; }
 
 check_task_completion() {
     local output="$1"
+    local exit_code="${2:-0}"
+
+    if [[ ! "$exit_code" =~ ^[0-9]+$ ]]; then
+        exit_code=1
+    fi
+
+    if [ "$exit_code" -ne 0 ]; then
+        echo "failed"
+        return
+    fi
 
     if echo "$output" | grep -qE "(Interrupted.*What should Codex do|请指示如何继续|用户是否希望我：|AskUserQuestion)"; then
         echo "waiting_input"
@@ -45,6 +55,9 @@ OUTPUT=""
 TASK_ID="${CODING_AGENT_TASK_ID:-}"
 SESSION_DIR="${CODING_AGENT_SESSION_DIR:-$RESULT_DIR}"
 EXIT_CODE="${CODEX_EXIT_CODE:-0}"
+if [[ ! "$EXIT_CODE" =~ ^[0-9]+$ ]]; then
+    EXIT_CODE=1
+fi
 
 if [ -n "$PAYLOAD" ]; then
     event_type="$(printf '%s' "$PAYLOAD" | jq -r '.type // empty' 2>/dev/null || true)"
@@ -86,7 +99,7 @@ else
         log "Output from task-output.txt (${#OUTPUT} chars)"
     fi
 
-    [ -z "$OUTPUT" ] && OUTPUT="任务已完成（exit_code=${EXIT_CODE}），但输出为空。"
+    [ -z "$OUTPUT" ] && OUTPUT="任务结束（exit_code=${EXIT_CODE}），但输出为空。"
 fi
 
 META_FILE=""
@@ -111,13 +124,10 @@ fi
 log "meta: task=$TASK_NAME target=$FEISHU_TARGET task_id=$TASK_ID"
 
 DONE_TS="$(date -Iseconds)"
-COMPLETION_STATUS=$(check_task_completion "$OUTPUT")
+COMPLETION_STATUS=$(check_task_completion "$OUTPUT" "$EXIT_CODE")
 log "Task completion status: $COMPLETION_STATUS"
 
-WRITE_STATUS="done"
-if [ "$COMPLETION_STATUS" = "waiting_input" ]; then
-    WRITE_STATUS="waiting_input"
-fi
+WRITE_STATUS="$COMPLETION_STATUS"
 
 TASK_FILE="${RESULT_DIR}/tasks/${TASK_ID}.json"
 if [ -f "$TASK_FILE" ]; then
@@ -125,7 +135,8 @@ if [ -f "$TASK_FILE" ]; then
        --arg output "$OUTPUT" \
        --arg thread_id "${THREAD_ID:-}" \
        --arg status "$WRITE_STATUS" \
-       '. + {status: $status, timestamp: $ts, output: $output, completed_at: $ts, thread_id: $thread_id}' \
+       --arg exit_code "$EXIT_CODE" \
+       '. + {status: $status, timestamp: $ts, output: $output, completed_at: $ts, thread_id: $thread_id, exit_code: ($exit_code | tonumber)}' \
        "$TASK_FILE" > "${TASK_FILE}.tmp" 2>/dev/null && mv "${TASK_FILE}.tmp" "$TASK_FILE"
 else
     jq -n \
@@ -136,7 +147,8 @@ else
         --arg target "$FEISHU_TARGET" \
         --arg thread_id "${THREAD_ID:-}" \
         --arg status "$WRITE_STATUS" \
-        '{task_name: $task, task_id: $task_id, feishu_target: $target, timestamp: $ts, output: $output, status: $status, completed_at: $ts, thread_id: $thread_id}' \
+        --arg exit_code "$EXIT_CODE" \
+        '{task_name: $task, task_id: $task_id, feishu_target: $target, timestamp: $ts, output: $output, status: $status, completed_at: $ts, thread_id: $thread_id, exit_code: ($exit_code | tonumber)}' \
         > "$TASK_FILE" 2>/dev/null
 fi
 log "Wrote tasks/${TASK_ID}.json (status=$WRITE_STATUS)"
@@ -148,12 +160,14 @@ jq -n \
     --arg task_id "$TASK_ID" \
     --arg target "$FEISHU_TARGET" \
     --arg status "$WRITE_STATUS" \
-    '{task_name: $task, task_id: $task_id, feishu_target: $target, timestamp: $ts, output: $output, status: $status}' \
+    --arg exit_code "$EXIT_CODE" \
+    '{task_name: $task, task_id: $task_id, feishu_target: $target, timestamp: $ts, output: $output, status: $status, exit_code: ($exit_code | tonumber)}' \
     > "${RESULT_DIR}/latest.json" 2>/dev/null
 log "Wrote latest.json"
 
 if [ -n "$META_FILE" ] && [ -f "$META_FILE" ]; then
-    jq --arg ts "$DONE_TS" --arg status "$WRITE_STATUS" '. + {completed_at: $ts, status: $status}' \
+    jq --arg ts "$DONE_TS" --arg status "$WRITE_STATUS" --arg exit_code "$EXIT_CODE" \
+       '. + {completed_at: $ts, status: $status, exit_code: ($exit_code | tonumber)}' \
         "$META_FILE" > "${META_FILE}.tmp" 2>/dev/null && mv "${META_FILE}.tmp" "$META_FILE"
 fi
 
@@ -161,7 +175,7 @@ if [ -z "$TASK_COMPLETED_AT" ]; then
     TASK_COMPLETED_AT="$DONE_TS"
 fi
 
-if [ "$COMPLETION_STATUS" != "done" ]; then
+if [ "$COMPLETION_STATUS" = "waiting_input" ]; then
     log "Task not completed (status=$COMPLETION_STATUS), skip notifications"
     log "=== notify-agi.sh completed ==="
     exit 0
@@ -172,6 +186,11 @@ LOCK_AGE_LIMIT=30
 SKIP_NOTIFY=false
 HAS_VALID_OUTPUT=false
 if [ -n "$OUTPUT" ] && ! echo "$OUTPUT" | grep -qF "输出为空"; then
+    HAS_VALID_OUTPUT=true
+fi
+if [ "$COMPLETION_STATUS" = "failed" ]; then
+    # A failed task must still produce a real failure notification even when
+    # the runner emitted no final assistant message.
     HAS_VALID_OUTPUT=true
 fi
 
@@ -204,8 +223,14 @@ fi
 
 if [ -n "$FEISHU_TARGET" ] && [ -x "$OPENCLAW_BIN" ]; then
     SUMMARY=$(echo "$OUTPUT" | tail -c 1000 | tr '\n' ' ')
-    MSG="🤖 *Codex 任务完成*
+    if [ "$COMPLETION_STATUS" = "failed" ]; then
+        STATUS_LABEL="失败"
+    else
+        STATUS_LABEL="完成"
+    fi
+    MSG="🤖 *Codex 任务${STATUS_LABEL}*
 📋 任务: ${TASK_NAME}
+🔢 退出码: ${EXIT_CODE}
 📝 结果摘要:
 \`\`\`
 ${SUMMARY:0:800}

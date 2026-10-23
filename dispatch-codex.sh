@@ -121,41 +121,17 @@ PROMPT="${RUNTIME_CONTEXT}
 
 ${PROMPT}"
 
-# ---- 0. Append tail prompt (same pattern as dispatch-claude-code.sh) ----
+# ---- 0. Append a scoped execution contract ----
 PROMPT="${PROMPT}
 
 ---
-【必须执行】任务完成后，你必须：
-
-1. 统计任务总用时和各阶段用时
-2. 分析执行过程中的优化点（哪些步骤耗时长、哪些失败重试了、哪些流程可以改进）
-3. 给出 prompt 提示词或执行脚本的具体修改建议（如有）
-4. 将以上内容连同任务结果摘要（成功/失败状态、关键信息）一起发送到飞书群聊：
-
-\`\`\`bash
-openclaw message send --channel feishu --target \"${FEISHU_TARGET}\" --message \"<任务结果摘要 + 用时统计 + 优化建议>\" 2>/dev/null || true
-\`\`\`
-
-即使任务失败，也必须发送失败原因和已完成的阶段信息。这是强制要求，不可省略。
-
-5. 出错脚本修复、验证与 git 提交：任务结束前，对执行过程中出错的脚本进行修复；修复后必须重新运行验证，确认输出符合预期才算完成，禁止只修改不验证。凡是修复了脚本，验证通过后必须进入 /root/.openclaw 仓库，检查 git status 和 git diff，只提交本次修复涉及的文件，创建 git commit，并 push 到远程仓库。禁止提交无关改动、密钥文件、临时文件或大产物；若提交或 push 失败，必须在飞书失败通知中说明原因。**重要：执行 git add/commit/push 时必须使用 flock 排队锁**，避免多 agent 并行操作同一仓库导致 index.lock 冲突：
-   \`\`\`bash
-   flock /root/.openclaw/.git/git-commit.lock bash -c 'cd /root/.openclaw && git add <文件> && git commit --no-verify -m \"消息\" && git push origin master'
-   \`\`\`
-   如果获取锁超时（默认等 120 秒），说明其他 agent 正在 commit，等待后重试即可。
-
-6. 经验库读写：
-   - 目录结构：/root/.openclaw/skills/skill-memory/ 按 skill 名分为子目录（如 game-refactor/、code-before/、drbacklink/、wiki-sites/ 等），子目录内是按日期命名的经验文件 <YYYY-MM-DD>.md，同一天的所有任务经验合并到同一个日期文件里。
-   - 子目录推断：读取环境变量 \$CODING_AGENT_TMUX_SESSION，从中去掉末尾的动态参数部分（域名、站点名、序号等任务级变量），剩余的固定前缀即为子目录名（如 game-refactor-part4-homepage-1-superstarbaseballwiki → 子目录 game-refactor/；code-before-example.com → 子目录 code-before/；wiki 站点相关 → 子目录 wiki-sites/）。如不确定，先 ls /root/.openclaw/skills/skill-memory/ 查看所有子目录列表，选择最匹配的。
-   - 文件名：当天日期，即 /root/.openclaw/skills/skill-memory/<子目录>/<YYYY-MM-DD>.md（用执行当天日期，不要用任务名做文件名）。
-   - 执行前：读取该子目录下最近 3 天的日期文件（最近 3 个 <YYYY-MM-DD>.md），把里面的经验条目作为参考，主动规避已知问题。不要读取全部历史文件，只取最近 3 天即可。
-   - 执行后：将本次遇到的问题和改进建议追加写入当天的日期文件。同一天多次任务都追加到同一个日期文件，用 ## <本次域名或任务简称> 二级标题区分不同任务段落。如该日期文件不存在则先创建，并在首行写入标题行 # <子目录名> 经验 - <YYYY-MM-DD>，空一行后再追加经验段落。追加格式：
-     ## <本次域名或任务简称>
-     ### 遇到的问题
-     - <如实填写，无则写\"无明显问题\">
-     ### 改进建议
-     - <如实填写，无则写\"无\">
-     （末尾空一行）"
+【派发器统一执行契约】
+- 只按原任务范围执行；不得为修复问题擅自创建额外 Agent、Workflow、文档、测试或部署入口。
+- 成功和失败都必须保留真实退出码、stdout/stderr、证据路径和截图；不得伪造产物，也不得把 warning 写成 success。
+- 如需修改代码，先运行任务要求的验证；只提交本次任务实际改动，使用 main 分支和 origin/main，不提交凭证、tmp、生成产物或无关用户改动。
+- 任务要求发送 Feishu 摘要时发送一次真实摘要；通知失败必须保留真实退出码和错误，不得用 \`|| true\` 隐藏。
+- 长操作放到任务要求的后台会话；不得结束其他任务的浏览器、tmux 或登录态。
+"
 
 # ---- 0. Resolve runtime mode ----
 TMUX_SESSION="${TMUX_SESSION_NAME:-}"
@@ -312,8 +288,12 @@ else
 
     # Update meta with completion
     if [ -f "$META_FILE" ]; then
-        jq --arg code "$EXIT_CODE" --arg ts "$(date -Iseconds)" \
-            '. + {exit_code: ($code | tonumber), completed_at: $ts, status: "done"}' \
+        TASK_STATUS="failed"
+        if [ "$EXIT_CODE" -eq 0 ]; then
+            TASK_STATUS="done"
+        fi
+        jq --arg code "$EXIT_CODE" --arg ts "$(date -Iseconds)" --arg status "$TASK_STATUS" \
+            '. + {exit_code: ($code | tonumber), completed_at: $ts, status: $status}' \
             "$META_FILE" > "${META_FILE}.tmp" && mv "${META_FILE}.tmp" "$META_FILE"
     fi
 

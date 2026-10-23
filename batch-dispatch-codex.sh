@@ -197,6 +197,22 @@ wait_for_task_completion() {
         if [ -f "$task_file" ]; then
             local status=$(jq -r '.status // ""' "$task_file" 2>/dev/null || echo "")
             local timestamp=$(jq -r '.completed_at // ""' "$task_file" 2>/dev/null || echo "")
+            local run_mode=$(jq -r '.run_mode // ""' "$task_file" 2>/dev/null || echo "")
+            local tmux_session=$(jq -r '.tmux_session // ""' "$task_file" 2>/dev/null || echo "")
+            local tmux_socket=$(jq -r '.tmux_socket // ""' "$task_file" 2>/dev/null || echo "")
+
+            if [ "$status" = "running" ] && [ "$run_mode" = "tmux" ] \
+                && [ -n "$tmux_session" ] && [ -n "$tmux_socket" ]; then
+                if ! tmux -S "$tmux_socket" has-session -t "$tmux_session" 2>/dev/null; then
+                    local orphaned_at="$(date -Iseconds)"
+                    jq --arg ts "$orphaned_at" \
+                        '. + {status:"failed", exit_code:1, failure_reason:"tmux session ended before completion hook", completed_at:$ts}' \
+                        "$task_file" > "${task_file}.tmp" 2>/dev/null && mv "${task_file}.tmp" "$task_file"
+                    WAIT_RESULT="failed"
+                    echo "Task orphaned: $task_id (tmux session ended before completion hook)" >&2
+                    return 1
+                fi
+            fi
 
             if [ "$status" = "done" ]; then
                 local result_time=$(date -d "$timestamp" +%s 2>/dev/null || echo 0)
@@ -205,6 +221,11 @@ wait_for_task_completion() {
                     echo "Task completed: $task_id (${elapsed}s)"
                     return 0
                 fi
+            elif [ "$status" = "failed" ] || [ "$status" = "error" ]; then
+                local failure_reason=$(jq -r '.failure_reason // .output // "task reported failure"' "$task_file" 2>/dev/null || echo "task reported failure")
+                WAIT_RESULT="failed"
+                echo "Task failed: $task_id — ${failure_reason}" >&2
+                return 1
             elif [ "$status" = "waiting_input" ]; then
                 WAIT_RESULT="waiting_input"
                 echo "Task waiting for input: $task_id"
@@ -312,10 +333,11 @@ $prompt"
     else
         if [ "$WAIT_RESULT" = "timeout" ]; then
             TIMEOUT_COUNT=$((TIMEOUT_COUNT + 1))
+            FAILED_COUNT=$((FAILED_COUNT + 1))
             LAST_PROMPT="$prompt"
             LAST_TASK_ID="$task_id"
-            echo "   Timeout recorded as non-fatal, continue batch"
-            return 0
+            echo "   Timeout recorded as failure; stop-on-error=${STOP_ON_ERROR}"
+            return 1
         fi
         FAILED_COUNT=$((FAILED_COUNT + 1))
         LAST_PROMPT="$prompt"
