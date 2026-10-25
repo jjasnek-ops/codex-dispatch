@@ -140,6 +140,7 @@ def which(name: str) -> str | None:
 def build_headless_cmd(args: argparse.Namespace) -> list[str]:
     cmd: list[str] = [
         args.codex_bin,
+        "--no-daemon",
         "exec",
         *codex_model_args(args),
     ]
@@ -409,6 +410,7 @@ def run_tmux(args: argparse.Namespace) -> int:
     # Note: -a never and --dangerously-bypass-approvals-and-sandbox are mutually exclusive
     cmd_parts = [
         args.codex_bin,
+        "--no-daemon",
         *codex_model_args(args),
         "-C",
         cwd,
