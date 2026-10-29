@@ -41,7 +41,7 @@ class DispatchHealthTests(unittest.TestCase):
         runtime = directory / "runtime"
         runtime.mkdir()
         (runtime / "hooks").mkdir()
-        for name in ("codex_run.py", "watchdog.py"):
+        for name in ("codex_run.py", "watchdog.py", "task_state.py"):
             shutil.copy2(ROOT / name, runtime / name)
         shutil.copy2(NOTIFY_HOOK, runtime / "hooks/notify-agi.sh")
         return runtime
@@ -160,11 +160,17 @@ output.write_text(json.dumps({"ok": True, "status": "success", "summary": "fixtu
                      "DISPATCH_CONFIG": str(config), "CDP_PORT": "", "FIXTURE_NOTIFY_LOG": str(notice_log)},
                 capture_output=True, text=True, timeout=10)
             self.assertEqual(result.returncode, 0, result.stderr)
-            meta = json.loads((runtime / "data/task-meta.json").read_text())
+            meta = json.loads(next((runtime / "data/sessions").glob("*/task-meta.json")).read_text())
             self.assertEqual(meta["status"], "done")
             self.assertIn("fixture original request", Path(meta["prompt_file"]).read_text())
             for path in (runtime / "data/tasks" / (meta["task_id"] + ".json"), runtime / "data/latest.json"):
                 self.assertEqual(json.loads(path.read_text())["status"], "done")
+            deadline = time.monotonic() + 5
+            while time.monotonic() < deadline:
+                receipts = list((runtime / "data/outbox").glob("*.json"))
+                if len(receipts) == 2 and all(json.loads(p.read_text())["state"] == "delivered" for p in receipts):
+                    break
+                time.sleep(0.05)
             self.assertEqual(len(notice_log.read_text().splitlines()), 2)
 
     def test_capacity_empty_error_disappearance_and_echo_are_not_acknowledgements(self):

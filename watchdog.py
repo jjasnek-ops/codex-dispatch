@@ -12,6 +12,7 @@ models, restarts the worker, or repeats business stages itself.
 from __future__ import annotations
 
 import argparse
+import fcntl
 import json
 import os
 import re
@@ -20,6 +21,7 @@ import sys
 import time
 from datetime import datetime, timezone
 from pathlib import Path
+import task_state
 
 from codex_run import (
     find_codex_worker,
@@ -73,24 +75,10 @@ def load_meta(session_dir: Path) -> dict:
 
 
 def update_state(session_dir: Path, task_id: str, **updates: object) -> dict:
-    result_dir = SCRIPT_DIR / "data"
-    paths = [session_dir / "task-meta.json", result_dir / "tasks" / f"{task_id}.json"]
-    current: dict = {}
-    seen: set[str] = set()
-    for path in paths:
-        if str(path) in seen or not path.exists():
-            continue
-        seen.add(str(path))
-        try:
-            data = json.loads(path.read_text())
-        except (OSError, json.JSONDecodeError):
-            continue
-        if not isinstance(data, dict):
-            continue
-        data.update(updates)
-        atomic_json(path, data)
-        current = data
-    return current
+    try:
+        return task_state.update(session_dir, task_id, updates, root=SCRIPT_DIR)
+    except task_state.StaleTask:
+        return {}
 
 
 def has_session(socket_path: str, session: str) -> bool:
@@ -102,62 +90,19 @@ def has_session(socket_path: str, session: str) -> bool:
 
 
 def notify_failure(session_dir: Path, task_id: str, reason: str) -> None:
-    if not NOTIFY_SCRIPT.exists():
-        return
-    meta = load_meta(session_dir)
-    env = {
-        "PATH": os.environ.get("PATH", ""),
-        "HOME": os.environ.get("HOME", str(Path.home())),
-        "CODING_AGENT_TASK_ID": task_id,
-        "CODING_AGENT_SESSION_DIR": str(session_dir),
-        "CODEX_EXIT_CODE": "1",
-        "CODEX_FAILURE_REASON": reason,
-        "CODEX_TASK_OUTPUT": str(session_dir / "task-output.txt"),
-    }
+    # check_once already owns the task lock. Use its reentrant transaction,
+    # not a child Hook process that would wait forever for the parent's flock.
     try:
-        subprocess.run(
-            [str(NOTIFY_SCRIPT)],
-            env=env,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            timeout=12,
-            check=False,
-        )
-    except (OSError, subprocess.TimeoutExpired):
+        _, receipt = task_state.hook(session_dir, task_id, "failed", reason, 1)
+        task_state.schedule_delivery(receipt)
+    except (OSError, ValueError):
         pass
 
 
 def notify_warning(meta: dict, reason: str) -> None:
-    target = str(meta.get("feishu_target") or "").strip()
-    if not target:
-        return
-    message = (
-        "⚠️ Codex 任务健康告警\n"
-        f"📋 任务: {meta.get('task_name', 'unknown')}\n"
-        f"📝 事件: {reason}\n"
-        "任务未被自动终止，请检查 tmux 与业务阶段证据。"
-    )
-    try:
-        subprocess.run(
-            [
-                "/usr/bin/timeout",
-                "8",
-                "/usr/bin/openclaw",
-                "message",
-                "send",
-                "--channel",
-                "feishu",
-                "--target",
-                target,
-                "--message",
-                message,
-            ],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            check=False,
-        )
-    except OSError:
-        pass
+    path = task_state.enqueue(meta, "health-" + snapshot_digest(reason),
+        f"Codex 任务健康告警：{meta.get('task_name', 'unknown')}\n{reason}", root=SCRIPT_DIR)
+    task_state.schedule_delivery(path)
 
 
 def capacity_index(snapshot: str) -> int:
@@ -355,6 +300,27 @@ def handle_capacity(
 
 
 def check_once(args: argparse.Namespace, state: dict) -> tuple[dict, bool]:
+    # Hold the transaction across the fresh UI read and any send. Multiple
+    # checkers cannot consume the same retry slot or target a later generation.
+    with task_state.lock(args.session_dir):
+        try:
+            meta = task_state.current(args.session_dir, args.task_id)
+        except (task_state.StaleTask, OSError, ValueError):
+            return state, True
+        if meta.get("tmux_instance") and has_session(args.socket, args.tmux_session):
+            try:
+                instance = subprocess.check_output(tmux_cmd(args.socket, "display-message", "-p", "-t",
+                    "=" + args.tmux_session, "#{session_id}:#{session_created}"), text=True).strip()
+                generation = subprocess.check_output(tmux_cmd(args.socket, "show-options", "-v", "-t",
+                    instance.split(":")[0], "@dispatch-task-id"), text=True).strip()
+            except subprocess.CalledProcessError:
+                return meta, True
+            if instance != meta["tmux_instance"] or generation != args.task_id:
+                return meta, True
+        return _check_once_locked(args, state)
+
+
+def _check_once_locked(args: argparse.Namespace, state: dict) -> tuple[dict, bool]:
     session_dir = Path(args.session_dir)
     meta = load_meta(session_dir)
     if not meta:
@@ -363,10 +329,16 @@ def check_once(args: argparse.Namespace, state: dict) -> tuple[dict, bool]:
 
     status = str(meta.get("status") or "")
     if status in TERMINAL_STATUSES:
+        # Hook may have committed the terminal result before its delivery worker
+        # could start. The durable receipt is idempotent and owns its budget.
+        task_state.schedule_delivery(meta.get("notification_receipt"))
         return meta, True
 
     target = f"{args.tmux_session}:0.0"
     current_time = time.time()
+    if meta.get("session_deadline_epoch") and current_time >= meta["session_deadline_epoch"] and not meta.get("deadline_notified"):
+        update_state(session_dir, args.task_id, deadline_notified=True)
+        notify_warning(meta, "Task deadline reached; session retained for authorized recovery (not killed)")
     started_at = epoch(str(meta.get("startup_started_at") or meta.get("started_at") or ""))
 
     if not has_session(args.socket, args.tmux_session):
@@ -492,12 +464,22 @@ def main() -> int:
     parser.add_argument("--once", action="store_true")
     args = parser.parse_args()
 
-    state: dict = {}
-    while True:
-        state, done = check_once(args, state)
-        if done or args.once:
-            return 0
-        time.sleep(max(1, args.interval))
+    with (Path(args.session_dir) / ".watchdog.lock").open("a+") as singleton:
+        deadline = time.monotonic() + 30
+        while True:
+            try:
+                fcntl.flock(singleton, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                if time.monotonic() >= deadline:
+                    return 0
+                time.sleep(0.2)
+        state: dict = {}
+        while True:
+            state, done = check_once(args, state)
+            if done or args.once:
+                return 0
+            time.sleep(max(1, args.interval))
 
 
 if __name__ == "__main__":

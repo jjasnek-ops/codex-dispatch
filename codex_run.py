@@ -8,6 +8,7 @@ Tmux mode: run codex-wrapper.sh inside a tmux session
 from __future__ import annotations
 
 import argparse
+from contextlib import nullcontext
 import hashlib
 import json
 import os
@@ -19,6 +20,10 @@ import shutil
 import tempfile
 import time
 from pathlib import Path
+# Also imported by the strict Part driver via spec_from_file_location.
+if str(Path(__file__).resolve().parent) not in sys.path:
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+import task_state
 
 DEFAULT_CODEX = os.environ.get("CODEX_BIN") or shutil.which("codex") or "/usr/local/bin/codex"
 SCRIPT_DIR = Path(__file__).parent
@@ -107,19 +112,10 @@ def _update_task_state(**updates: object) -> None:
     if not session_dir or not task_id:
         return
 
-    result_dir = SCRIPT_DIR / "data"
-    paths = [Path(session_dir) / "task-meta.json", result_dir / "tasks" / f"{task_id}.json"]
-    seen: set[str] = set()
-    for path in paths:
-        if str(path) in seen or not path.exists():
-            continue
-        seen.add(str(path))
-        try:
-            data = json.loads(path.read_text())
-            data.update(updates)
-            _atomic_write_json(path, data)
-        except (OSError, json.JSONDecodeError) as exc:
-            print(f"Warning: failed to update task state {path}: {exc}", file=sys.stderr, flush=True)
+    try:
+        task_state.update(session_dir, task_id, updates, root=SCRIPT_DIR)
+    except (OSError, ValueError) as exc:
+        print(f"Task state update rejected: {type(exc).__name__}", file=sys.stderr, flush=True)
 
 
 def codex_update_check_args(args: argparse.Namespace) -> list[str]:
@@ -272,12 +268,8 @@ def run_headless(args: argparse.Namespace) -> int:
         last_heartbeat_at=_now_iso(),
     )
     exit_code = proc.wait()
-    _update_task_state(
-        status="done" if exit_code == 0 else "failed",
-        lifecycle_stage="completed" if exit_code == 0 else "worker_failed",
-        exit_code=exit_code,
-        completed_at=_now_iso(),
-    )
+    # Completion Hook checks the final message together with the process exit.
+    _update_task_state(worker_exit_code=exit_code, worker_ended_at=_now_iso())
 
     # Try to extract thread_id from output file if available
     if args.output_file and Path(args.output_file).exists():
@@ -301,9 +293,7 @@ def _save_thread_id(thread_id: str, args: argparse.Namespace) -> None:
     if not meta_file.exists():
         return
     try:
-        meta = json.loads(meta_file.read_text())
-        meta["thread_id"] = thread_id
-        meta_file.write_text(json.dumps(meta, ensure_ascii=False, indent=2))
+        _update_task_state(thread_id=thread_id)
         print(f"Saved thread_id={thread_id} to task-meta.json", flush=True)
     except Exception as e:
         print(f"Warning: failed to save thread_id: {e}", file=sys.stderr)
@@ -568,7 +558,8 @@ def compact_tmux_prompt(prompt: str | None) -> str | None:
 
 
 def tmux_paste_prompt(socket_path: str, target: str, prompt: str) -> None:
-    with tempfile.NamedTemporaryFile(mode="w", delete=False, suffix=".txt", encoding="utf-8") as f:
+    (SCRIPT_DIR / "tmp").mkdir(exist_ok=True)
+    with tempfile.NamedTemporaryFile(mode="w", delete=False, suffix=".txt", encoding="utf-8", dir=SCRIPT_DIR / "tmp") as f:
         f.write(prompt)
         temp_file = f.name
 
@@ -591,8 +582,6 @@ def tmux_paste_prompt(socket_path: str, target: str, prompt: str) -> None:
 
 
 def run_tmux(args: argparse.Namespace) -> int:
-    _ensure_directory_trusted(args.cwd)
-    _ensure_notify_configured()
     if not which("tmux"):
         print("tmux not found in PATH; cannot run tmux mode.", file=sys.stderr)
         return 2
@@ -609,44 +598,42 @@ def run_tmux(args: argparse.Namespace) -> int:
     if args.prompt and prompt and prompt != args.prompt:
         print(f"Compacted tmux prompt: {len(args.prompt)} -> {len(prompt)} chars", flush=True)
 
-    # Create new session, replacing old one if it exists
-    # Note: kill-session on the last session kills the server too, so we
-    # create the new session first, then kill the old one.
+    # Never implicitly replace a live session. tmux new is the final race guard.
     session_exists = subprocess.run(
-        tmux_cmd(socket_path, "has-session", "-t", session),
+        tmux_cmd(socket_path, "has-session", "-t", "=" + session),
         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
     ).returncode == 0
 
     if session_exists:
-        # Create new session with temp name, kill old, rename
-        tmp_session = f"{session}__new"
-        subprocess.check_call(tmux_cmd(socket_path, "new", "-d", "-s", tmp_session, "-n", "shell"))
-        subprocess.run(tmux_cmd(socket_path, "kill-session", "-t", session), stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        subprocess.check_call(tmux_cmd(socket_path, "rename-session", "-t", tmp_session, session))
-    else:
+        print("tmux session exists; resume original task instead of redispatch", file=sys.stderr)
+        return STARTUP_GATE_EXIT_CODE
+    generation = os.environ.get("CODING_AGENT_TASK_ID", "")
+    session_dir = os.environ.get("CODING_AGENT_SESSION_DIR", "")
+    with task_state.lock(session_dir) if session_dir else nullcontext():
+        if session_dir:
+            try:
+                meta = task_state.current(session_dir, generation)
+                if meta.get("status") in task_state.TERMINAL:
+                    return STARTUP_GATE_EXIT_CODE
+            except (OSError, ValueError):
+                return STARTUP_GATE_EXIT_CODE
         subprocess.check_call(tmux_cmd(socket_path, "new", "-d", "-s", session, "-n", "shell"))
-
-    _update_task_state(
-        status="starting",
-        lifecycle_stage="worker_starting",
-        tmux_session=session,
-        tmux_socket=socket_path,
-        startup_started_at=_now_iso(),
-    )
+        instance = subprocess.check_output(tmux_cmd(socket_path, "display-message", "-p", "-t", "=" + session,
+                                                   "#{session_id}:#{session_created}"), text=True).strip()
+        subprocess.check_call(tmux_cmd(socket_path, "set-option", "-t", instance.split(":")[0], "@dispatch-task-id", generation))
+        _update_task_state(status="starting", lifecycle_stage="worker_starting", tmux_session=session,
+                           tmux_socket=socket_path, tmux_instance=instance, tmux_generation=generation,
+                           startup_started_at=_now_iso())
+    _ensure_directory_trusted(args.cwd)
+    _ensure_notify_configured()
     watchdog_pid = start_watchdog(socket_path, session)
     if watchdog_pid:
         print(f"Started dispatch watchdog: pid={watchdog_pid}", flush=True)
 
-    # Start session self-destruct timer (independent process group)
-    session_ttl = int(os.environ.get("SESSION_TTL", "43200"))  # default 12 hours
-    if session_ttl > 0:
-        subprocess.Popen(
-            ["setsid", "bash", "-c",
-             f"sleep {session_ttl} && tmux -S {shlex.quote(socket_path)} kill-session -t {shlex.quote(session)} 2>/dev/null"],
-            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
-        )
-    else:
-        print("Session self-destruct timer disabled (SESSION_TTL<=0)", flush=True)
+    # Deadlines warn through the fenced watchdog; never kill by a reused name.
+    session_ttl = max(0, int(os.environ.get("SESSION_TTL", "43200")))
+    if session_ttl:
+        _update_task_state(session_deadline_epoch=time.time() + session_ttl)
 
     # Inject API config at tmux session level first, then shell as backup.
     # This matches coding-agent and reduces timing issues for spawned shell processes.

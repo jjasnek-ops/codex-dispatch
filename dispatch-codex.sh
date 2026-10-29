@@ -136,6 +136,11 @@ PROMPT="${PROMPT}
 
 # ---- 0. Resolve runtime mode ----
 TMUX_SESSION="${TMUX_SESSION_NAME:-}"
+if [ -n "$ENABLE_TMUX" ]; then
+    TMUX_SESSION_NAME="${TMUX_SESSION_NAME:-codex-agent}"
+    TMUX_SESSION="$TMUX_SESSION_NAME"
+    [[ "$TMUX_SESSION_NAME" =~ ^[A-Za-z0-9_-]+$ ]] || { echo 'Invalid tmux session name' >&2; exit 1; }
+fi
 if [ -z "$TASK_NAME" ]; then
     TASK_NAME="${TMUX_SESSION_NAME:-adhoc-$(date +%s)}"
 fi
@@ -165,8 +170,8 @@ if [ -n "$TMUX_SESSION_NAME" ]; then
     SESSION_DIR="${RESULT_DIR}/sessions/${TMUX_SESSION_NAME}"
     META_FILE="${SESSION_DIR}/task-meta.json"
 else
-    SESSION_DIR="${RESULT_DIR}"
-    META_FILE="${RESULT_DIR}/task-meta.json"
+    SESSION_DIR="${RESULT_DIR}/sessions/${TASK_ID}"
+    META_FILE="${SESSION_DIR}/task-meta.json"
 fi
 
 # Keep stdout/stderr and watchdog evidence isolated per task. The old global
@@ -209,13 +214,12 @@ jq -n \
     --arg tmux_session "$TMUX_SESSION" \
     --arg tmux_socket "$TMUX_SOCKET" \
     '{task_name: $name, task_id: $task_id, feishu_target: $target, cdp_port: $cdp_port, callback_session: $session, prompt: $prompt, prompt_file: $prompt_file, effective_prompt: $effective_prompt, model: $model, workdir: $workdir, started_at: $ts, run_mode: $run_mode, tmux_session: $tmux_session, tmux_socket: $tmux_socket, status: "starting", lifecycle_stage: "dispatch_started", health_status: "starting"}' \
-    > "$META_FILE"
+    | python3 "$SCRIPT_DIR/task_state.py" init --session-dir "$SESSION_DIR"
 
 if [ -n "$SESSION_DIR" ] && [ "$SESSION_DIR" != "$RESULT_DIR" ]; then
     echo "$TASK_ID" > "${SESSION_DIR}/current-task-id.txt"
 fi
 
-cp "$META_FILE" "${RESULT_DIR}/tasks/${TASK_ID}.json"
 
 echo "Task metadata written: $META_FILE"
 echo "   Task ID: $TASK_ID"
@@ -229,14 +233,9 @@ mark_dispatch_failure() {
     local code="${2:-1}"
     local ts
     ts="$(date -Iseconds)"
-    local task_file="${RESULT_DIR}/tasks/${TASK_ID}.json"
-    for state_file in "$META_FILE" "$task_file"; do
-        if [ -f "$state_file" ]; then
-            jq --arg reason "$reason" --arg code "$code" --arg ts "$ts" \
-                '. + {status:"failed", lifecycle_stage:"startup_failed", health_status:"failed", failure_reason:$reason, exit_code:($code|tonumber), completed_at:$ts, last_health_event:$reason}' \
-                "$state_file" > "${state_file}.tmp" && mv "${state_file}.tmp" "$state_file"
-        fi
-    done
+    jq -n --arg reason "$reason" --arg code "$code" --arg ts "$ts" \
+        '{status:"failed", lifecycle_stage:"startup_failed", health_status:"failed", failure_reason:$reason, exit_code:($code|tonumber), completed_at:$ts, last_health_event:$reason}' \
+        | python3 "$SCRIPT_DIR/task_state.py" update --session-dir "$SESSION_DIR" --task-id "$TASK_ID"
 }
 
 # ---- 2.5 Send start notification ----
@@ -253,8 +252,8 @@ tmux -S $TMUX_SOCKET attach -t $TMUX_SESSION
     else
         NOTIFY_MSG="🚀 Codex 任务已派发，正在执行启动检查: ${TASK_NAME}（headless 模式）"
     fi
-    timeout 30 /usr/bin/openclaw message send --channel feishu --target "$FEISHU_TARGET" \
-        --message "$NOTIFY_MSG" 2>/dev/null || true
+    printf '%s' "$NOTIFY_MSG" | python3 "$SCRIPT_DIR/task_state.py" notify \
+        --session-dir "$SESSION_DIR" --task-id "$TASK_ID" --kind startup
 fi
 
 # ---- 3. Clear previous output ----
@@ -301,8 +300,10 @@ fi
 # ---- 6. Run Codex ----
 if [ -n "$ENABLE_TMUX" ]; then
     echo "Creating tmux session: $TMUX_SESSION"
+    set +e
     "${CMD[@]}" 2>&1 | tee "$TASK_OUTPUT"
     EXIT_CODE=${PIPESTATUS[0]}
+    set -e
     echo ""
     if [ "$EXIT_CODE" -ne 0 ]; then
         EXISTING_STATUS=$(jq -r '.status // ""' "$META_FILE" 2>/dev/null || echo "")
@@ -321,7 +322,7 @@ if [ -n "$ENABLE_TMUX" ]; then
     else
         CURRENT_STATUS=$(jq -r '.status // ""' "$META_FILE" 2>/dev/null || echo "")
         CURRENT_STAGE=$(jq -r '.lifecycle_stage // ""' "$META_FILE" 2>/dev/null || echo "")
-        if [ "$CURRENT_STATUS" != "running" ] && [ "$CURRENT_STATUS" != "failed" ]; then
+        if [ "$CURRENT_STATUS" != "running" ] && [ "$CURRENT_STATUS" != "failed" ] && [ "$CURRENT_STATUS" != "done" ] && [ "$CURRENT_STATUS" != "waiting_input" ]; then
             mark_dispatch_failure "runner returned success without a running worker (stage=${CURRENT_STAGE:-unknown})" "23"
             echo "Codex startup health gate did not produce a running worker" >&2
             EXIT_CODE=23
@@ -334,23 +335,15 @@ else
     echo "   Command: ${CMD[*]}"
     echo ""
 
+    set +e
     "${CMD[@]}" 2>&1 | tee "$TASK_OUTPUT"
     EXIT_CODE=${PIPESTATUS[0]}
+    set -e
 
     echo ""
     echo "Codex exited with code: $EXIT_CODE"
 
-    # Update meta with completion
-    if [ -f "$META_FILE" ]; then
-        TASK_STATUS="failed"
-        if [ "$EXIT_CODE" -eq 0 ]; then
-            TASK_STATUS="done"
-        fi
-        jq --arg code "$EXIT_CODE" --arg ts "$(date -Iseconds)" --arg status "$TASK_STATUS" \
-            --arg stage "$([ "$EXIT_CODE" -eq 0 ] && echo completed || echo worker_failed)" \
-            '. + {exit_code: ($code | tonumber), completed_at: $ts, status: $status, lifecycle_stage: $stage}' \
-            "$META_FILE" > "${META_FILE}.tmp" && mv "${META_FILE}.tmp" "$META_FILE"
-    fi
+    # Only Hook may publish the final status, after interpreting final JSON.
 
     # Call notify-agi.sh directly in headless mode
     if [ -x "$NOTIFY_SCRIPT" ]; then

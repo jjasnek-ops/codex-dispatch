@@ -12,6 +12,8 @@ allowed-tools: Bash(codex-dispatch:*)
 
 # Codex Dispatch Skill
 
+**【修改位置 3】本次统一任务代次隔离、状态事务和逐任务通知 outbox；同名派发不再替换活跃会话，TTL 到期只告警，不按名字清理。已有进程不热更新，也不会自动取消旧进程已安排的计时器。**
+
 本 skill 是给后续 agent 用的调用规范。OpenClaw agent 只负责任务发放，真正执行由 Codex 在 tmux 会话中完成。
 
 ## 固定流程（必须）
@@ -21,6 +23,15 @@ allowed-tools: Bash(codex-dispatch:*)
 3. 调用 `dispatch-codex.sh`，不要直接运行 `codex` 或 `codex exec`。
 4. dispatch 会写入 `starting` 状态、启动 tmux、执行 Codex worker/UI 启动门禁并发送启动通知；只有真实 worker 和 prompt 已提交后才转为 `running`。hook 会在任务完成后写结果和发送完成通知；启动失败由 dispatch/watchdog 记录为失败，不得把 tmux 存在误报为运行中。
 5. dispatch 命令返回后立即回复用户 tmux 观察命令，不要 attach，不要轮询等待任务完成。
+
+### 状态与通知边界
+
+- `task_state.py` 是 runner、Hook、watchdog 的唯一状态写入口。`task-meta.json` 为权威，镜像带同一 revision；事务锁覆盖重新读取、更新、提交与镜像。进程中断后的镜像在下一次事务中修复，不把多文件更新声称为同一瞬间原子可见。
+- task_id、Codex thread 和 tmux 实例身份必须匹配；旧回调、旧 watchdog 不得操作同名新任务。done/failed/error 为不可逆终态，迟到进度不能重新打开任务。重复 turn-id 幂等忽略。
+- 同名活跃/等待任务或仍存在的 tmux 会话会拒绝重新派发；授权续跑应使用原任务会话和检查点。不要为绕过拒绝而删除元数据、清理旧会话或生成新 ID。headless 任务使用各自的状态目录。
+- `SESSION_TTL`（默认 43200 秒）只产生一次健康告警，保留会话；不安排 kill-session。业务结束和实例清理是不同动作，清理需要针对已确认的具体实例另行授权。
+- 通知按 task_id + 事件 + 通道 + 收件目标去重，回执位于 `data/outbox/*.json`。入队不等于送达；只有通道命令退出 0 才写 delivered_at。每条最多 3 次尝试，失败保留退出码，等待 5/10 秒后重试；不因其他任务通知而静默丢弃。
+- 意外退出后，可对**原回执**运行 `python3 task_state.py drain --receipt <absolute-outbox-json>`，保留尝试次数。已送达或耗尽的不再发送；不要删回执重置预算。发送方崩溃在远端接受与本地登记之间时可能重复送达，不宣称网络 exactly-once。watchdog 终态检查也会尝试交接未完成的终态回执。
 
 ## 参数规则
 

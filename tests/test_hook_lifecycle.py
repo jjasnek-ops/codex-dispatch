@@ -25,10 +25,13 @@ def exercise_lifecycle(root):
            "CODEX_EXIT_CODE": "0", "CODEX_FAILURE_REASON": "", "FEISHU_TARGET": ""}
     result = {"synthetic": True, "business_sessions_modified": False}
     watcher = None
+    turn_sequence = 0
 
     def hook(message):
+        nonlocal turn_sequence
+        turn_sequence += 1
         payload = json.dumps({"type": "agent-turn-complete", "thread-id": "fixture",
-            "turn-id": "fixture-turn", "last-assistant-message": message})
+            "turn-id": f"fixture-turn-{turn_sequence}", "last-assistant-message": message})
         subprocess.run(["bash", str(runtime / "hooks/notify-agi.sh"), payload],
                        env=env, check=True, capture_output=True, timeout=5)
 
