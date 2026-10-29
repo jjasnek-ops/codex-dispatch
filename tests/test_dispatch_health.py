@@ -14,6 +14,7 @@ import time
 import unittest
 import shlex
 import threading
+import tomllib
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from unittest.mock import patch
@@ -62,6 +63,16 @@ class DispatchHealthTests(unittest.TestCase):
     def capacity_args(self):
         return argparse.Namespace(socket="unused.sock", capacity_retries=3, capacity_delay_s=30,
             capacity_max_delay_s=300, capacity_response_timeout_s=10, capacity_input=watchdog.DEFAULT_CAPACITY_INPUT)
+
+    def test_empty_tmux_context_is_never_a_valid_identity(self):
+        with patch.object(codex_run.subprocess, "check_output", return_value=":\n"):
+            with self.assertRaisesRegex(ValueError, "invalid_tmux_instance"):
+                codex_run.tmux_session_instance("unused", "fixture")
+
+    def test_prompt_echo_and_existing_work_do_not_confirm_submission(self):
+        before = "• Working on previous request\n› Ask Codex to do anything\n"
+        self.assertFalse(codex_run.prompt_response_observed(before, before + "› new prompt\n"))
+        self.assertTrue(codex_run.prompt_response_observed(before, before + "• Ran python3\n"))
 
     def test_real_parallel_prompt_pastes_use_task_local_named_buffers(self):
         with tempfile.TemporaryDirectory(prefix="paste-") as directory:
@@ -163,7 +174,8 @@ class DispatchHealthTests(unittest.TestCase):
                 commands = list(pool.map(build, projects))
             self.assertEqual(original, config.read_bytes())
             for project, command in zip(projects, commands):
-                self.assertIn('projects.' + json.dumps(str(project)) + '.trust_level="trusted"', command)
+                override = next(value for value in command if value.startswith("projects="))
+                self.assertEqual(tomllib.loads(override)["projects"][str(project)]["trust_level"], "trusted")
                 self.assertIn("notify=" + json.dumps([codex_run.NOTIFY_SCRIPT]), command)
 
     def hook_states(self, output, *, interactive=True, exit_code=0):
@@ -206,7 +218,11 @@ class DispatchHealthTests(unittest.TestCase):
                     self.assertEqual(state["lifecycle_stage"], "business_started")
                     self.assertNotIn("completed_at", state)
                     self.assertNotIn("exit_code", state)
-                    self.assertTrue(state["last_turn_completed_at"])
+                    if output.lstrip().startswith('{"title":') or output.startswith('{\n  "title":'):
+                        self.assertNotIn("thread_id", state)
+                        self.assertNotIn("last_turn_completed_at", state)
+                    else:
+                        self.assertTrue(state["last_turn_completed_at"])
 
     def test_hook_title_does_not_override_explicit_terminal_status(self):
         for status in ("success", "success_with_warnings"):
@@ -255,7 +271,7 @@ output.write_text(json.dumps({"ok": True, "status": "success", "summary": "fixtu
             bin_dir = root / "bin"
             bin_dir.mkdir()
             shim = bin_dir / "timeout"
-            shim.write_text('#!/bin/sh\n[ "$2" = "/usr/bin/openclaw" ] || exit 95\nprintf "blocked\\n" >> "$FIXTURE_NOTIFY_LOG"\n')
+            shim.write_text('#!/bin/sh\n[ "$1" = "--kill-after=5" ] && shift\n[ "$2" = "/usr/bin/openclaw" ] || exit 95\nprintf "blocked\\n" >> "$FIXTURE_NOTIFY_LOG"\n')
             shim.chmod(0o755)
             config = root / "dispatch-config.json"
             config.write_text('{}')

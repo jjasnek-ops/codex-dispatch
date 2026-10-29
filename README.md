@@ -1,5 +1,7 @@
 # Codex Dispatch
 
+**【修改位置 3】本次真实烟测修复：完整 pane 实例标识与格式检查、bracketed paste 和响应确认、兼容当前 CLI 的 inline-table trust 参数、忽略后台标题通知并按事件去重，以及 45 秒有界发送和真实 message ID 回执。旧进程不热更新，已耗尽通知预算不重置。**
+
 **【修改位置 2】本次修改说明：配置不再写全局文件，提示词使用独立命名 buffer；交互 resume、等待输入后的持续监控、通知意图与状态镜像的崩溃恢复已补齐。详见 SKILL.md 的状态与通知边界。**
 
 `codex-dispatch/` 是独立的 Codex 任务派发目录。它负责把任务送进 Codex tmux 会话，让学生可以在 tmux 或 Claw Remote 面板里同步观察执行现场。
@@ -40,7 +42,7 @@ codex --version
 codex
 ```
 
-**【修改位置 3】Codex hook 使用本次进程的 `-c notify=[...]` 参数，真实路径由运行器位置确定；项目 trust 也使用进程级覆盖。无需创建或修改 `~/.codex/config.toml`，已有全局配置保持原样。Hook 会记录任务状态和通知意图，outbox 只在发送成功后登记送达。严格 Part 通过最后的 `-c notify=[]` 禁用父任务回调。启动前只需检查 Hook 可执行：**
+**【修改位置 3】Codex hook 使用本次进程的 `-c notify=[...]` 参数，真实路径由运行器位置确定；项目 trust 也使用进程级覆盖。调度器无需创建或修改 `~/.codex/config.toml`；Codex CLI 自身仍可能持久化信任或 TUI 设置，不把调度器不写文件等同于整个 CLI 运行期间文件不变。Hook 会记录任务状态和通知意图，outbox 只在发送成功后登记送达。严格 Part 通过最后的 `-c notify=[]` 禁用父任务回调。启动前只需检查 Hook 可执行：**
 
 ```bash
 test -x /root/.openclaw/skills/codex-dispatch/hooks/notify-agi.sh

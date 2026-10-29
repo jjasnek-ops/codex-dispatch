@@ -28,6 +28,7 @@ from codex_run import (
     snapshot_digest,
     tmux_capture,
     tmux_cmd,
+    tmux_session_instance,
 )
 
 
@@ -310,11 +311,10 @@ def check_once(args: argparse.Namespace, state: dict) -> tuple[dict, bool]:
             return state, True
         if meta.get("tmux_instance") and has_session(args.socket, args.tmux_session):
             try:
-                instance = subprocess.check_output(tmux_cmd(args.socket, "display-message", "-p", "-t",
-                    "=" + args.tmux_session, "#{session_id}:#{session_created}"), text=True).strip()
+                instance = tmux_session_instance(args.socket, args.tmux_session)
                 generation = subprocess.check_output(tmux_cmd(args.socket, "show-options", "-v", "-t",
                     instance.split(":")[0], "@dispatch-task-id"), text=True).strip()
-            except subprocess.CalledProcessError:
+            except (subprocess.CalledProcessError, ValueError):
                 return meta, True
             if instance != meta["tmux_instance"] or generation != args.task_id:
                 return meta, True

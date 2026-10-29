@@ -12,6 +12,8 @@ allowed-tools: Bash(codex-dispatch:*)
 
 # Codex Dispatch Skill
 
+**【修改位置 8】本次真实烟测修复：用完整 pane 目标取得并校验 `$session_id:created`，拒绝空实例；命名缓冲区启用 bracketed paste，启动成功还须观察到实际响应。项目 trust 使用 TOML inline table 的进程参数，避免带引号的 dotted path 被当前 CLI 忽略。后台仅含 title 的通知不认领任务线程；同一回合按具体事件去重，保留线程/任务身份与终态保护。发送超时为 45 秒，超时后最多再给 5 秒结束进程，仍最多 3 次，不重置旧回执预算；成功时保留真实通道 message ID（若返回）。**
+
 **【修改位置 4】本次修改说明：提示词改用独立命名缓冲区；trust/notify 改用进程参数；交互模式真正传递 resume；等待输入时保留 watchdog；通知意图与状态共同提交，终态检查恢复镜像和 outbox。**
 
 **【修改位置 3】本次统一任务代次隔离、状态事务和逐任务通知 outbox；同名派发不再替换活跃会话，TTL 到期只告警，不按名字清理。已有进程不热更新，也不会自动取消旧进程已安排的计时器。**
@@ -32,7 +34,7 @@ allowed-tools: Bash(codex-dispatch:*)
 - **【修改位置 6】所有通知意图先记录在 `task-meta.json.notification_events`；终态写入自动同时记录终态通知意图，再生成镜像和 outbox。重启后的 watchdog 即使遇到终态，也先补齐镜像及缺失的发送回执，再交接未完成的通知。既有回执的 attempts/delivered 状态不重置；未提交的事件不能提前发送。**
 - **【修改位置 7】`waiting_input` 不是 watchdog 的退出条件：保留同一 singleton，暂停自动输入及容量重试，不消耗新预算；真实 Hook 回到 running 后继续健康检查。已有旧 watchdog 不会热加载或自动重启。交互 `--resume <session-id/name>` 明确执行 `codex resume <session-id/name>`，不落入选择器，也不覆盖仍存在的同名 tmux。**
 - `task_state.py` 是 runner、Hook、watchdog 的唯一状态写入口。`task-meta.json` 为权威，镜像带同一 revision；事务锁覆盖重新读取、更新、提交与镜像。进程中断后的镜像在下一次事务中修复，不把多文件更新声称为同一瞬间原子可见。
-- task_id、Codex thread 和 tmux 实例身份必须匹配；旧回调、旧 watchdog 不得操作同名新任务。done/failed/error 为不可逆终态，迟到进度不能重新打开任务。重复 turn-id 幂等忽略。
+- **【修改位置 8】task_id、Codex thread 和 tmux 实例身份必须匹配；旧回调、旧 watchdog 不得操作同名新任务。done/failed/error 为不可逆终态，迟到进度不能重新打开任务。同一 turn-id 的重复事件幂等忽略，但允许当前回合的真实进度继续进入终态；已被后续回合取代的回调不能倒退状态。后台仅含 title 的通知只做旧状态/镜像兼容修复，不认领线程，不更新任务活动时间。**
 - 同名活跃/等待任务或仍存在的 tmux 会话会拒绝重新派发；授权续跑应使用原任务会话和检查点。不要为绕过拒绝而删除元数据、清理旧会话或生成新 ID。headless 任务使用各自的状态目录。
 - `SESSION_TTL`（默认 43200 秒）只产生一次健康告警，保留会话；不安排 kill-session。业务结束和实例清理是不同动作，清理需要针对已确认的具体实例另行授权。
 - 通知按 task_id + 事件 + 通道 + 收件目标去重，回执位于 `data/outbox/*.json`。入队不等于送达；只有通道命令退出 0 才写 delivered_at。每条最多 3 次尝试，失败保留退出码，等待 5/10 秒后重试；不因其他任务通知而静默丢弃。

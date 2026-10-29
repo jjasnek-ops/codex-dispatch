@@ -70,8 +70,11 @@ def _ensure_directory_trusted(cwd: str | None) -> list[str]:
     except (subprocess.CalledProcessError, FileNotFoundError):
         pass
 
-    return [arg for path in paths_to_trust
-            for arg in ("-c", f'projects.{json.dumps(path, ensure_ascii=False)}.trust_level="trusted"')]
+    # CLI dotted-key overrides do not unquote path components. Supply the map
+    # as a TOML inline table so paths remain literal keys in current Codex.
+    projects = ", ".join(json.dumps(path, ensure_ascii=False) + '={trust_level="trusted"}'
+                         for path in paths_to_trust)
+    return ["-c", "projects={" + projects + "}"]
 
 
 NOTIFY_SCRIPT = str(SCRIPT_DIR / "hooks" / "notify-agi.sh")
@@ -289,6 +292,22 @@ def _save_thread_id(thread_id: str, args: argparse.Namespace) -> None:
 
 def tmux_cmd(socket_path: str, *args: str) -> list[str]:
     return ["tmux", "-S", socket_path, *args]
+
+
+def tmux_session_instance(socket_path: str, session: str) -> str:
+    # display-message targets a pane. A bare '=session' can succeed with ':'
+    # and no context; that must never become a task's fencing identity.
+    instance = subprocess.check_output(tmux_cmd(socket_path, "display-message", "-p", "-t",
+        "=" + session + ":0.0", "#{session_id}:#{session_created}"), text=True).strip()
+    if not re.fullmatch(r"\$\d+:[1-9]\d*", instance):
+        raise ValueError("invalid_tmux_instance")
+    return instance
+
+
+def prompt_response_observed(before: str, after: str) -> bool:
+    baseline = {line.strip() for line in before.splitlines()}
+    return any(re.match(r"^[•●■]\s+\S", line.strip()) and line.strip() not in baseline
+               for line in after.splitlines())
 
 
 def tmux_capture(socket_path: str, target: str, lines: int = 200) -> str:
@@ -551,7 +570,7 @@ def tmux_paste_prompt(socket_path: str, target: str, prompt: str) -> None:
     buffer_name = "dispatch-" + uuid.uuid4().hex
     try:
         subprocess.check_call(tmux_cmd(socket_path, "load-buffer", "-b", buffer_name, temp_file))
-        subprocess.check_call(tmux_cmd(socket_path, "paste-buffer", "-b", buffer_name, "-d", "-t", target))
+        subprocess.check_call(tmux_cmd(socket_path, "paste-buffer", "-p", "-b", buffer_name, "-d", "-t", target))
         paste_wait_s = min(1.5, 0.35 + (len(prompt) / 6000.0))
         time.sleep(paste_wait_s)
         subprocess.check_call(tmux_cmd(socket_path, "send-keys", "-t", target, "Enter"))
@@ -609,8 +628,7 @@ def run_tmux(args: argparse.Namespace) -> int:
             except (OSError, ValueError):
                 return STARTUP_GATE_EXIT_CODE
         subprocess.check_call(tmux_cmd(socket_path, "new", "-d", "-s", session, "-n", "shell"))
-        instance = subprocess.check_output(tmux_cmd(socket_path, "display-message", "-p", "-t", "=" + session,
-                                                   "#{session_id}:#{session_created}"), text=True).strip()
+        instance = tmux_session_instance(socket_path, session)
         subprocess.check_call(tmux_cmd(socket_path, "set-option", "-t", instance.split(":")[0], "@dispatch-task-id", generation))
         _update_task_state(status="starting", lifecycle_stage="worker_starting", tmux_session=session,
                            tmux_socket=socket_path, tmux_instance=instance, tmux_generation=generation,
@@ -726,12 +744,21 @@ def run_tmux(args: argparse.Namespace) -> int:
 
         if prompt:
             time.sleep(0.2)
+            before_prompt = tmux_capture(socket_path, target, lines=180)
             tmux_paste_prompt(socket_path, target, prompt)
-            time.sleep(1.0)
-            try:
-                post_prompt_snapshot = tmux_capture(socket_path, target, lines=180)
-            except subprocess.CalledProcessError:
-                post_prompt_snapshot = ""
+            deadline = time.monotonic() + 30
+            submitted = False
+            while time.monotonic() < deadline:
+                try:
+                    post_prompt_snapshot = tmux_capture(socket_path, target, lines=180)
+                except subprocess.CalledProcessError:
+                    post_prompt_snapshot = ""
+                if prompt_response_observed(before_prompt, post_prompt_snapshot):
+                    submitted = True
+                    break
+                if find_codex_worker(socket_path, target) is None:
+                    break
+                time.sleep(0.25)
             live_worker = find_codex_worker(socket_path, target)
             if live_worker is None:
                 if has_update_marker(post_prompt_snapshot):
@@ -739,15 +766,21 @@ def run_tmux(args: argparse.Namespace) -> int:
                 else:
                     startup_error = "Codex worker disappeared after prompt submission"
                 break
+            if not submitted:
+                startup_error = "codex_prompt_submission_unconfirmed"
+                break
             worker_pid = live_worker[0]
-            _update_task_state(
-                status="running",
-                lifecycle_stage="business_started",
-                worker_pid=worker_pid,
-                business_started_at=_now_iso(),
-                last_heartbeat_at=_now_iso(),
-                update_restart_attempted=update_restart_attempted,
-            )
+            # A fast real Hook may already have parked or completed the task.
+            with task_state.lock(session_dir) if session_dir else nullcontext():
+                current_status = task_state.current(session_dir, generation).get("status") if session_dir else "starting"
+                _update_task_state(
+                    status=current_status if current_status in {"waiting_input", "done", "failed", "error"} else "running",
+                    lifecycle_stage="waiting_input" if current_status == "waiting_input" else "business_started",
+                    worker_pid=worker_pid,
+                    business_started_at=_now_iso(),
+                    last_heartbeat_at=_now_iso(),
+                    update_restart_attempted=update_restart_attempted,
+                )
         else:
             _update_task_state(
                 status="running",

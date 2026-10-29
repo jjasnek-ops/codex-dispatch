@@ -70,6 +70,42 @@ class TaskStateTests(unittest.TestCase):
         S.hook(self.session, "new-task", "running", "progress", 0, "thread", "turn-1")
         self.assertEqual(self.meta(), before)
 
+    def test_title_and_actual_result_share_turn_without_losing_result(self):
+        S.hook(self.session, "new-task", "running", '{"title":"smoke"}', 0, "thread", "turn-1")
+        S.hook(self.session, "new-task", "waiting_input", '{"status":"waiting_input"}', 0, "thread", "turn-1")
+        self.assertEqual(self.meta()["status"], "waiting_input")
+        before = self.meta()
+        S.hook(self.session, "new-task", "running", '{"title":"late title"}', 0, "thread", "turn-1")
+        self.assertEqual(self.meta(), before)
+        S.hook(self.session, "new-task", "running", '{"status":"running"}', 0, "thread", "turn-2")
+        S.hook(self.session, "new-task", "done", '{"ok":true,"status":"success"}', 0, "thread", "turn-2")
+        self.assertEqual(self.meta()["status"], "done")
+        before = self.meta()
+        S.hook(self.session, "new-task", "done", '{"ok":true,"status":"success"}', 0, "thread", "turn-2")
+        self.assertEqual(self.meta(), before)
+
+    def test_background_title_cannot_claim_or_conflict_with_real_thread(self):
+        before = self.meta()
+        S.hook(self.session, "new-task", "running", '{"title":"name"}', 0, "title-thread", "title-turn")
+        self.assertEqual(before, self.meta())
+        S.hook(self.session, "new-task", "waiting_input", '{"status":"waiting_input"}', 0, "real-thread", "real-turn")
+        self.assertEqual(self.meta()["thread_id"], "real-thread")
+        before = self.meta()
+        S.hook(self.session, "new-task", "running", '{"title":"name"}', 0, "other-title-thread", "title-turn-2")
+        self.assertEqual(before, self.meta())
+
+    def test_late_old_turn_cannot_change_resumed_turn(self):
+        S.hook(self.session, "new-task", "running", "first", 0, "thread", "turn-1")
+        S.hook(self.session, "new-task", "running", "second", 0, "thread", "turn-2")
+        before = self.meta()
+        S.hook(self.session, "new-task", "waiting_input", "late first", 0, "thread", "turn-1")
+        self.assertEqual(self.meta(), before)
+
+    def test_legacy_turn_id_only_progress_can_accept_real_final(self):
+        S.update(self.session, "new-task", {"hook_turn_ids": ["turn-1"], "thread_id": "thread", "output": '{"title":"old"}'})
+        S.hook(self.session, "new-task", "done", '{"ok":true,"status":"success"}', 0, "thread", "turn-1")
+        self.assertEqual(self.meta()["status"], "done")
+
     def test_wrong_thread_cannot_publish_terminal(self):
         S.hook(self.session, "new-task", "running", "progress", 0, "right-thread", "turn-1")
         with self.assertRaises(S.StaleTask):
@@ -138,6 +174,18 @@ class TaskStateTests(unittest.TestCase):
             S.drain(path)
         self.assertEqual(S.read(path)["attempts"], 2)
         self.assertEqual(S.read(path)["state"], "delivered")
+
+    def test_notification_budget_covers_measured_cli_startup_and_keeps_channel_id(self):
+        path = S.enqueue({**self.meta(), "feishu_target": "fixture-no-network"}, "terminal-done", "complete")
+        result = subprocess.CompletedProcess([], 0, stdout='{"result":{"messageId":"om_fixture_real_id"}}')
+        with patch.object(S.subprocess, "run", return_value=result) as transport:
+            S.drain(path)
+        command = transport.call_args.args[0]
+        self.assertEqual(command[2], "45")
+        self.assertIn("--kill-after=5", command)
+        self.assertEqual(transport.call_args.kwargs["timeout"], 52)
+        self.assertEqual(S.read(path)["transport_message_id"], "om_fixture_real_id")
+        self.assertEqual(S.read(path)["attempts"], 1)
 
     def test_crashed_mirror_write_reconciles_from_canonical(self):
         with patch.object(S, "mirror", side_effect=OSError("simulated crash after canonical commit")):
@@ -295,14 +343,15 @@ class TaskStateTests(unittest.TestCase):
             return subprocess.check_output(["tmux", "-S", socket, *args], stderr=subprocess.DEVNULL, text=True).strip()
         tmux("new-session", "-d", "-s", "fixture", "sleep 60")
         try:
-            instance = tmux("display-message", "-p", "-t", "=fixture", "#{session_id}:#{session_created}")
+            instance = codex_run.tmux_session_instance(socket, "fixture")
+            self.assertRegex(instance, r"^\$\d+:[1-9]\d*$")
             tmux("set-option", "-t", instance.split(":")[0], "@dispatch-task-id", "new-task")
             args = argparse.Namespace(cwd=str(self.root), tmux_socket_dir=str(self.root),
                 tmux_socket_name="isolation.sock", tmux_session="fixture", prompt="must not reach a model")
             with patch.object(codex_run, "_ensure_directory_trusted") as trust:
                 self.assertEqual(codex_run.STARTUP_GATE_EXIT_CODE, codex_run.run_tmux(args))
                 trust.assert_not_called()
-            self.assertEqual(instance, tmux("display-message", "-p", "-t", "=fixture", "#{session_id}:#{session_created}"))
+            self.assertEqual(instance, codex_run.tmux_session_instance(socket, "fixture"))
             S.update(self.session, "new-task", {"tmux_instance": instance, "tmux_generation": "new-task",
                 "session_deadline_epoch": time.time() - 1, "started_at": S.now()})
             check = argparse.Namespace(session_dir=str(self.session), task_id="new-task", socket=socket,
@@ -310,13 +359,14 @@ class TaskStateTests(unittest.TestCase):
             with patch.object(watchdog, "SCRIPT_DIR", self.root), patch.object(watchdog, "find_codex_worker", return_value=None):
                 watchdog.check_once(check, {})
             self.assertTrue(self.meta()["deadline_notified"])
-            self.assertEqual(instance, tmux("display-message", "-p", "-t", "=fixture", "#{session_id}:#{session_created}"))
+            self.assertEqual(instance, codex_run.tmux_session_instance(socket, "fixture"))
             # Reuse only our own isolated name. The old generation must stop
             # before checking/sending to the new target, even if its name agrees.
             tmux("new-session", "-d", "-s", "keep-server", "sleep 60")
             tmux("kill-session", "-t", "=fixture")
             tmux("new-session", "-d", "-s", "fixture", "sleep 60")
-            replacement = tmux("display-message", "-p", "-t", "=fixture", "#{session_id}:#{session_created}")
+            replacement = codex_run.tmux_session_instance(socket, "fixture")
+            self.assertNotEqual(instance, replacement)
             tmux("set-option", "-t", replacement.split(":")[0], "@dispatch-task-id", "replacement")
             before = self.meta()
             with patch.object(watchdog, "find_codex_worker") as worker:
@@ -324,7 +374,7 @@ class TaskStateTests(unittest.TestCase):
                 self.assertTrue(done)
                 worker.assert_not_called()
             self.assertEqual(before, self.meta())
-            self.assertEqual(replacement, tmux("display-message", "-p", "-t", "=fixture", "#{session_id}:#{session_created}"))
+            self.assertEqual(replacement, codex_run.tmux_session_instance(socket, "fixture"))
         finally:
             subprocess.run(["tmux", "-S", socket, "kill-server"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 

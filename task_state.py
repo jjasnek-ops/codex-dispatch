@@ -23,6 +23,7 @@ import time
 
 ROOT = Path(__file__).resolve().parent
 TERMINAL = {"done", "failed", "error"}
+DELIVERY_TIMEOUT_SECONDS = 45
 _local = threading.local()
 _thread_lock = threading.RLock()
 
@@ -258,10 +259,18 @@ def drain(path):
             item.update(state="sending", attempt_started_at=now())
             atomic_json(path, item)
             try:
-                proc = subprocess.run(["timeout", "8", "/usr/bin/openclaw", "message", "send", "--channel",
-                    item["channel"], "--target", item["target"], "--message", item["message"]],
-                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=10)
+                proc = subprocess.run(["timeout", "--kill-after=5", str(DELIVERY_TIMEOUT_SECONDS),
+                    "/usr/bin/openclaw", "message", "send", "--channel", item["channel"],
+                    "--target", item["target"], "--message", item["message"], "--json"],
+                    capture_output=True, text=True, timeout=DELIVERY_TIMEOUT_SECONDS + 7)
                 code = proc.returncode
+                # Retain an actual channel id when available, not arbitrary CLI
+                # logs (which could contain private configuration diagnostics).
+                if code == 0:
+                    match = re.search(r'"(?:messageId|message_id)"\s*:\s*"(om_[A-Za-z0-9_-]+)"',
+                                      getattr(proc, "stdout", "") or "")
+                    if match:
+                        item["transport_message_id"] = match[1]
             except (OSError, subprocess.TimeoutExpired):
                 code = 124
             item["last_exit_code"] = code
@@ -276,10 +285,32 @@ def drain(path):
 def hook(session_dir, task_id, status, output, exit_code, thread_id="", turn_id=""):
     with lock(session_dir):
         meta = current(session_dir, task_id)
+        try:
+            payload = json.loads(output)
+        except (ValueError, TypeError):
+            payload = None
+        # Codex's background title generator inherits notify and task env, but
+        # is not the task thread. Never let its title-only event claim identity.
+        if status == "running" and isinstance(payload, dict) and set(payload) == {"title"}:
+            # Legacy records may still need mirror/field repair, without
+            # treating the background title as activity of the real task.
+            if meta.get("status") not in TERMINAL and ("completed_at" in meta or "exit_code" in meta):
+                meta = update(session_dir, task_id, {})
+            else:
+                reconcile_derived(session_dir, meta)
+            return meta, None
         if meta.get("thread_id") and thread_id and meta["thread_id"] != thread_id:
             raise StaleTask("stale_hook_thread")
         seen = meta.get("hook_turn_ids", [])
-        if turn_id and turn_id in seen:
+        event_key = hashlib.sha256(json.dumps([thread_id, turn_id, status, output, exit_code]).encode()).hexdigest()
+        events = meta.get("hook_event_keys", [])
+        last_turn = meta.get("last_hook_turn_id") or (seen[-1] if seen else "")
+        # A current Codex turn can notify a title/progress before its real final
+        # reply with the SAME turn-id. Deduplicate events, not whole turns.
+        duplicate = turn_id and event_key in events
+        stale = turn_id and turn_id in seen and last_turn != turn_id
+        regressive = turn_id and turn_id == last_turn and meta.get("status") == "waiting_input" and status == "running"
+        if duplicate or stale or regressive:
             meta = reconcile(session_dir, task_id)
             return meta, meta.get("notification_receipt")
         if meta.get("status") in TERMINAL:
@@ -293,7 +324,9 @@ def hook(session_dir, task_id, status, output, exit_code, thread_id="", turn_id=
         if thread_id:
             meta["thread_id"] = thread_id
         if turn_id:
-            meta["hook_turn_ids"] = (seen + [turn_id])[-256:]
+            meta["hook_turn_ids"] = (seen + ([turn_id] if turn_id not in seen else []))[-256:]
+            meta["hook_event_keys"] = (events + [event_key])[-256:]
+            meta["last_hook_turn_id"] = turn_id
         if status in TERMINAL:
             failed_stage = "startup_failed" if meta.get("lifecycle_stage") == "startup_failed" else "worker_failed"
             meta.update(completed_at=meta.get("completed_at") or now(), exit_code=exit_code,

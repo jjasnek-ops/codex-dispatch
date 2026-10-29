@@ -25,6 +25,5 @@ if os.environ.get("FAKE_CODEX_CAPACITY"):
 for line in sys.stdin:
     if line.strip():
         print("fake prompt accepted", flush=True)
-        if os.environ.get("FAKE_CODEX_CAPACITY"):
-            print("• Working (1s • esc to interrupt)", flush=True)
+        print("• Working (1s • esc to interrupt)", flush=True)
     time.sleep(0.1)
