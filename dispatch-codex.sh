@@ -140,6 +140,16 @@ if [ -z "$TASK_NAME" ]; then
 fi
 TASK_ID="${TASK_NAME}_$(date +%Y%m%d_%H%M%S)_$$"
 
+# The Website Create orchestrator may have prepared a credential-free request
+# before dispatch. Make the actual dispatch identity available in the prompt
+# so it can create an immutable request copy with the authoritative task_id;
+# callers must not guess this value from timestamps or process ids.
+PROMPT="${PROMPT}
+
+---
+【派发器权威任务身份】
+- CODING_AGENT_TASK_ID=${TASK_ID}：需要恢复控制器的任务必须使用该值作为 task_id；不得猜测、复用旧值或修改调用方源请求。"
+
 RUN_MODE="headless"
 TMUX_SOCKET=""
 if [ -n "$ENABLE_TMUX" ]; then
@@ -157,6 +167,11 @@ else
     SESSION_DIR="${RESULT_DIR}"
     META_FILE="${RESULT_DIR}/task-meta.json"
 fi
+
+# Keep stdout/stderr and watchdog evidence isolated per task. The old global
+# task-output.txt allowed concurrent dispatches to overwrite each other's
+# startup diagnostics.
+TASK_OUTPUT="${SESSION_DIR}/task-output.txt"
 
 # ---- 1. Prepare prompt file ----
 mkdir -p "$RESULT_DIR" "$RESULT_DIR/tasks" "$PROMPTS_DIR" "$WORKDIR"
@@ -192,7 +207,7 @@ jq -n \
     --arg run_mode "$RUN_MODE" \
     --arg tmux_session "$TMUX_SESSION" \
     --arg tmux_socket "$TMUX_SOCKET" \
-    '{task_name: $name, task_id: $task_id, feishu_target: $target, cdp_port: $cdp_port, callback_session: $session, prompt: $prompt, prompt_file: $prompt_file, effective_prompt: $effective_prompt, model: $model, workdir: $workdir, started_at: $ts, run_mode: $run_mode, tmux_session: $tmux_session, tmux_socket: $tmux_socket, status: "running"}' \
+    '{task_name: $name, task_id: $task_id, feishu_target: $target, cdp_port: $cdp_port, callback_session: $session, prompt: $prompt, prompt_file: $prompt_file, effective_prompt: $effective_prompt, model: $model, workdir: $workdir, started_at: $ts, run_mode: $run_mode, tmux_session: $tmux_session, tmux_socket: $tmux_socket, status: "starting", lifecycle_stage: "dispatch_started", health_status: "starting"}' \
     > "$META_FILE"
 
 if [ -n "$SESSION_DIR" ] && [ "$SESSION_DIR" != "$RESULT_DIR" ]; then
@@ -208,10 +223,25 @@ echo "   Target: ${FEISHU_TARGET:-none}"
 echo "   CDP: ${CDP_PORT:-none}"
 echo "   Prompt file: $PROMPT_FILE"
 
+mark_dispatch_failure() {
+    local reason="$1"
+    local code="${2:-1}"
+    local ts
+    ts="$(date -Iseconds)"
+    local task_file="${RESULT_DIR}/tasks/${TASK_ID}.json"
+    for state_file in "$META_FILE" "$task_file"; do
+        if [ -f "$state_file" ]; then
+            jq --arg reason "$reason" --arg code "$code" --arg ts "$ts" \
+                '. + {status:"failed", lifecycle_stage:"startup_failed", health_status:"failed", failure_reason:$reason, exit_code:($code|tonumber), completed_at:$ts, last_health_event:$reason}' \
+                "$state_file" > "${state_file}.tmp" && mv "${state_file}.tmp" "$state_file"
+        fi
+    done
+}
+
 # ---- 2.5 Send start notification ----
 if [ -n "$FEISHU_TARGET" ]; then
     if [ -n "$ENABLE_TMUX" ]; then
-        NOTIFY_MSG="🚀 Codex 任务启动: ${TASK_NAME}
+        NOTIFY_MSG="🚀 Codex 任务已派发，正在执行启动检查: ${TASK_NAME}
 
 Tmux 会话: $TMUX_SESSION
 
@@ -220,7 +250,7 @@ Tmux 会话: $TMUX_SESSION
 tmux -S $TMUX_SOCKET attach -t $TMUX_SESSION
 \`\`\`"
     else
-        NOTIFY_MSG="🚀 Codex 任务启动: ${TASK_NAME}（headless 模式，无 tmux 会话）"
+        NOTIFY_MSG="🚀 Codex 任务已派发，正在执行启动检查: ${TASK_NAME}（headless 模式）"
     fi
     timeout 30 /usr/bin/openclaw message send --channel feishu --target "$FEISHU_TARGET" \
         --message "$NOTIFY_MSG" 2>/dev/null || true
@@ -273,8 +303,31 @@ if [ -n "$ENABLE_TMUX" ]; then
     "${CMD[@]}" 2>&1 | tee "$TASK_OUTPUT"
     EXIT_CODE=${PIPESTATUS[0]}
     echo ""
-    echo "Task sent to codex session: $TMUX_SESSION"
-    echo "To watch: tmux -S $TMUX_SOCKET attach -t $TMUX_SESSION"
+    if [ "$EXIT_CODE" -ne 0 ]; then
+        EXISTING_STATUS=$(jq -r '.status // ""' "$META_FILE" 2>/dev/null || echo "")
+        if [ "$EXISTING_STATUS" != "failed" ]; then
+            mark_dispatch_failure "codex runner failed during startup health gate (exit_code=${EXIT_CODE})" "$EXIT_CODE"
+        fi
+        if [ -x "$NOTIFY_SCRIPT" ]; then
+            CODEX_EXIT_CODE="$EXIT_CODE" \
+            CODING_AGENT_TASK_ID="$TASK_ID" \
+            CODING_AGENT_SESSION_DIR="$SESSION_DIR" \
+            CODEX_FAILURE_REASON="$(jq -r '.failure_reason // "codex startup health gate failed"' "$META_FILE" 2>/dev/null || echo "codex startup health gate failed")" \
+            CODEX_TASK_OUTPUT="$TASK_OUTPUT" \
+                "$NOTIFY_SCRIPT" || true
+        fi
+        echo "Codex startup health gate failed; task marked failed: $TASK_ID" >&2
+    else
+        CURRENT_STATUS=$(jq -r '.status // ""' "$META_FILE" 2>/dev/null || echo "")
+        CURRENT_STAGE=$(jq -r '.lifecycle_stage // ""' "$META_FILE" 2>/dev/null || echo "")
+        if [ "$CURRENT_STATUS" != "running" ] && [ "$CURRENT_STATUS" != "failed" ]; then
+            mark_dispatch_failure "runner returned success without a running worker (stage=${CURRENT_STAGE:-unknown})" "23"
+            echo "Codex startup health gate did not produce a running worker" >&2
+            EXIT_CODE=23
+        fi
+        echo "Task passed Codex startup health gate: $TMUX_SESSION"
+        echo "To watch: tmux -S $TMUX_SOCKET attach -t $TMUX_SESSION"
+    fi
 else
     echo "Launching Codex (headless)..."
     echo "   Command: ${CMD[*]}"
@@ -293,7 +346,8 @@ else
             TASK_STATUS="done"
         fi
         jq --arg code "$EXIT_CODE" --arg ts "$(date -Iseconds)" --arg status "$TASK_STATUS" \
-            '. + {exit_code: ($code | tonumber), completed_at: $ts, status: $status}' \
+            --arg stage "$([ "$EXIT_CODE" -eq 0 ] && echo completed || echo worker_failed)" \
+            '. + {exit_code: ($code | tonumber), completed_at: $ts, status: $status, lifecycle_stage: $stage}' \
             "$META_FILE" > "${META_FILE}.tmp" && mv "${META_FILE}.tmp" "$META_FILE"
     fi
 

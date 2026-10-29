@@ -19,7 +19,7 @@ allowed-tools: Bash(codex-dispatch:*)
 1. 先回复用户：`收到，已将任务委派给 Codex 执行。`
 2. 确定参数：`USER_TASK`、`TMUX_SESSION`；需要覆盖默认浏览器时再提供 `CDP_PORT`。任务名默认继承 `TMUX_SESSION`，工作目录默认 `/root`。
 3. 调用 `dispatch-codex.sh`，不要直接运行 `codex` 或 `codex exec`。
-4. dispatch 会写任务状态、启动 tmux、发送启动通知；hook 会在任务完成后写结果和发送完成通知。
+4. dispatch 会写入 `starting` 状态、启动 tmux、执行 Codex worker/UI 启动门禁并发送启动通知；只有真实 worker 和 prompt 已提交后才转为 `running`。hook 会在任务完成后写结果和发送完成通知；启动失败由 dispatch/watchdog 记录为失败，不得把 tmux 存在误报为运行中。
 5. dispatch 命令返回后立即回复用户 tmux 观察命令，不要 attach，不要轮询等待任务完成。
 
 ## 参数规则
@@ -138,7 +138,13 @@ tmux -S /root/clawdbot-tmux-sockets/codex-code.sock attach -t <TMUX_SESSION>
 按 Ctrl+B 然后按 D 可以退出观察，不会终止任务。
 ```
 
+派发器默认关闭 Codex 启动时的自更新检查，并对“更新后需要重启”只做一次同会话重启。除维护或无副作用烟测外，不要传 `codex_run.py --allow-update-check`。
+
+tmux watchdog 对明确的 `Selected model is at capacity` + `Please try a different model`（允许相邻换行）提示，在同一 Codex 会话发送明确续跑指令；仅写入 tmux 不算恢复。每轮默认最多 3 次发送，不切模型、不重启业务、不重跑阶段；耗尽后 `waiting_input` 并告警。具体确认与退避规则见下文。可用 `CODEX_DISPATCH_CAPACITY_RETRIES`、`CODEX_DISPATCH_CAPACITY_DELAY_S`、`CODEX_DISPATCH_CAPACITY_MAX_DELAY_S`、`CODEX_DISPATCH_CAPACITY_RESPONSE_TIMEOUT_S` 和 `CODEX_DISPATCH_CAPACITY_INPUT` 调整。
+
 ## 关键文件路径
+
+**【修改位置 1】容量确认必须相对发送前基线：新工作标记或发送后的真实工具回合回执才算接受；错误消失、输入回显、旧 Working 计时变化都不算。面板变化不能跳过退避。默认最多 3 次发送，每次等响应 30 秒；前两次无响应后分别等 30/60 秒再发，第三次仍失败则 waiting_input。发送失败也占有界发送预算，但绝不是成功次数。既有 watchdog 不会热加载或被自动重启。**
 
 - Codex dispatch：`/root/.openclaw/skills/codex-dispatch/dispatch-codex.sh`
 - Codex runner：`/root/.openclaw/skills/codex-dispatch/codex_run.py`

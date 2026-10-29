@@ -8,6 +8,7 @@ Tmux mode: run codex-wrapper.sh inside a tmux session
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import re
@@ -75,6 +76,66 @@ def _ensure_directory_trusted(cwd: str | None) -> None:
 
 
 NOTIFY_SCRIPT = str(SCRIPT_DIR / "hooks" / "notify-agi.sh")
+WATCHDOG_SCRIPT = SCRIPT_DIR / "watchdog.py"
+DEFAULT_CAPACITY_INPUT = (
+    "Continue the original task from the current recovery point; "
+    "reuse completed evidence and do not repeat completed stages."
+)
+STARTUP_GATE_EXIT_CODE = 23
+UPDATE_MARKERS = (
+    "updating codex",
+    "update ran successfully",
+    "please restart codex",
+)
+
+
+def _now_iso() -> str:
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
+
+def _atomic_write_json(path: Path, data: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n")
+    os.replace(tmp, path)
+
+
+def _update_task_state(**updates: object) -> None:
+    """Atomically mirror lifecycle/health fields into task metadata and snapshot."""
+    session_dir = os.environ.get("CODING_AGENT_SESSION_DIR", "")
+    task_id = os.environ.get("CODING_AGENT_TASK_ID", "")
+    if not session_dir or not task_id:
+        return
+
+    result_dir = SCRIPT_DIR / "data"
+    paths = [Path(session_dir) / "task-meta.json", result_dir / "tasks" / f"{task_id}.json"]
+    seen: set[str] = set()
+    for path in paths:
+        if str(path) in seen or not path.exists():
+            continue
+        seen.add(str(path))
+        try:
+            data = json.loads(path.read_text())
+            data.update(updates)
+            _atomic_write_json(path, data)
+        except (OSError, json.JSONDecodeError) as exc:
+            print(f"Warning: failed to update task state {path}: {exc}", file=sys.stderr, flush=True)
+
+
+def codex_update_check_args(args: argparse.Namespace) -> list[str]:
+    """Disable Codex startup self-updates for dispatched workers by default.
+
+    A one-shot escape hatch exists for maintenance/smoke tests, but production
+    dispatches must not mutate the executable while a side-effectful task is
+    starting.
+    """
+    if getattr(args, "allow_update_check", False):
+        return []
+    if os.environ.get("CODEX_DISPATCH_DISABLE_STARTUP_UPDATE", "1").strip().lower() in {
+        "0", "false", "no", "off",
+    }:
+        return []
+    return ["-c", "check_for_update_on_startup=false"]
 
 
 def _ensure_notify_configured() -> None:
@@ -141,6 +202,7 @@ def build_headless_cmd(args: argparse.Namespace) -> list[str]:
     cmd: list[str] = [
         args.codex_bin,
         "--no-daemon",
+        *codex_update_check_args(args),
         "exec",
         *codex_model_args(args),
     ]
@@ -197,11 +259,24 @@ def run_headless(args: argparse.Namespace) -> int:
     cmd = build_headless_cmd(args)
     print(f"Running: {' '.join(shlex.quote(c) for c in cmd)}", flush=True)
 
-    proc = subprocess.run(
+    proc = subprocess.Popen(
         cmd,
         cwd=args.cwd,
-        capture_output=False,
         text=True,
+    )
+    _update_task_state(
+        status="running",
+        lifecycle_stage="worker_started",
+        worker_pid=proc.pid,
+        worker_started_at=_now_iso(),
+        last_heartbeat_at=_now_iso(),
+    )
+    exit_code = proc.wait()
+    _update_task_state(
+        status="done" if exit_code == 0 else "failed",
+        lifecycle_stage="completed" if exit_code == 0 else "worker_failed",
+        exit_code=exit_code,
+        completed_at=_now_iso(),
     )
 
     # Try to extract thread_id from output file if available
@@ -214,7 +289,7 @@ def run_headless(args: argparse.Namespace) -> int:
         except Exception:
             pass
 
-    return proc.returncode
+    return exit_code
 
 
 def _save_thread_id(thread_id: str, args: argparse.Namespace) -> None:
@@ -279,6 +354,203 @@ def tmux_wait_for_any_text(
             pass
         time.sleep(poll_s)
     return False
+
+
+def tmux_pane_pid(socket_path: str, target: str) -> int | None:
+    try:
+        value = subprocess.check_output(
+            tmux_cmd(socket_path, "display-message", "-p", "-t", target, "#{pane_pid}"),
+            text=True,
+        ).strip()
+        return int(value) if value.isdigit() else None
+    except (subprocess.CalledProcessError, OSError, ValueError):
+        return None
+
+
+def tmux_current_command(socket_path: str, target: str) -> str:
+    try:
+        return subprocess.check_output(
+            tmux_cmd(socket_path, "display-message", "-p", "-t", target, "#{pane_current_command}"),
+            text=True,
+        ).strip()
+    except (subprocess.CalledProcessError, OSError):
+        return ""
+
+
+def descendant_processes(root_pid: int) -> list[tuple[int, str]]:
+    """Return process descendants without trusting tmux's shell prompt."""
+    try:
+        raw = subprocess.check_output(
+            ["ps", "-eo", "pid=,ppid=,args="], text=True, errors="replace"
+        )
+    except (subprocess.CalledProcessError, OSError):
+        return []
+
+    children: dict[int, list[tuple[int, str]]] = {}
+    for line in raw.splitlines():
+        parts = line.strip().split(None, 2)
+        if len(parts) < 3:
+            continue
+        try:
+            pid = int(parts[0])
+            ppid = int(parts[1])
+        except ValueError:
+            continue
+        children.setdefault(ppid, []).append((pid, parts[2]))
+
+    found: list[tuple[int, str]] = []
+    pending = [root_pid]
+    visited: set[int] = set()
+    while pending:
+        parent = pending.pop()
+        if parent in visited:
+            continue
+        visited.add(parent)
+        for pid, command in children.get(parent, []):
+            found.append((pid, command))
+            pending.append(pid)
+    return found
+
+
+def find_codex_worker(socket_path: str, target: str) -> tuple[int, str] | None:
+    pane_pid = tmux_pane_pid(socket_path, target)
+    if pane_pid is None:
+        return None
+    for pid, command in descendant_processes(pane_pid):
+        lower = command.lower()
+        if "--no-daemon" in lower and ("codex" in lower or "codex.js" in lower):
+            return pid, command
+    return None
+
+
+def has_update_marker(snapshot: str) -> bool:
+    lowered = snapshot.lower()
+    return any(marker in lowered for marker in UPDATE_MARKERS)
+
+
+def snapshot_digest(snapshot: str) -> str:
+    return hashlib.sha256(snapshot.encode("utf-8", errors="replace")).hexdigest()
+
+
+def wait_for_codex_ready(
+    socket_path: str,
+    target: str,
+    timeout_s: int = 20,
+    poll_s: float = 0.4,
+) -> dict[str, object]:
+    """Wait for both a real Codex descendant and a Codex UI marker.
+
+    A tmux session or a shell prompt is deliberately insufficient. The update
+    marker is returned separately so the caller can perform one bounded retry.
+    """
+    deadline = time.time() + timeout_s
+    last_snapshot = ""
+    while time.time() < deadline:
+        try:
+            last_snapshot = tmux_capture(socket_path, target, lines=240)
+        except subprocess.CalledProcessError:
+            last_snapshot = ""
+
+        worker = find_codex_worker(socket_path, target)
+        if worker and any(
+            marker in last_snapshot
+            for marker in ("OpenAI Codex", "Try new model", "Use existing model", "Tip:")
+        ):
+            return {"ready": True, "worker": worker, "snapshot": last_snapshot}
+        # Check the update marker only when no live Codex worker has reached
+        # the UI. The pane retains old lines across a one-shot restart.
+        if not worker and has_update_marker(last_snapshot):
+            return {
+                "ready": False,
+                "reason": "codex_requested_restart_after_update",
+                "snapshot": last_snapshot,
+            }
+        time.sleep(poll_s)
+
+    current_command = tmux_current_command(socket_path, target)
+    return {
+        "ready": False,
+        "reason": "codex_worker_or_ui_timeout",
+        "current_command": current_command,
+        "worker": find_codex_worker(socket_path, target),
+        "snapshot": last_snapshot,
+    }
+
+
+def start_watchdog(socket_path: str, session: str) -> int | None:
+    session_dir = os.environ.get("CODING_AGENT_SESSION_DIR", "")
+    task_id = os.environ.get("CODING_AGENT_TASK_ID", "")
+    if not session_dir or not task_id or os.environ.get("CODEX_DISPATCH_WATCHDOG", "1").lower() in {
+        "0", "false", "no", "off",
+    }:
+        return None
+    if not WATCHDOG_SCRIPT.exists():
+        print(f"Warning: watchdog script missing: {WATCHDOG_SCRIPT}", file=sys.stderr, flush=True)
+        return None
+
+    session_path = Path(session_dir)
+    session_path.mkdir(parents=True, exist_ok=True)
+    log_path = session_path / "watchdog.log"
+    log_handle = log_path.open("a", encoding="utf-8")
+
+    def positive_env(name: str, default: str) -> str:
+        value = os.environ.get(name, default).strip()
+        return value if value.isdigit() and int(value) > 0 else default
+
+    def nonnegative_env(name: str, default: str) -> str:
+        value = os.environ.get(name, default).strip()
+        return value if value.isdigit() else default
+
+    capacity_input = os.environ.get("CODEX_DISPATCH_CAPACITY_INPUT", DEFAULT_CAPACITY_INPUT).strip()
+    if not capacity_input or "\n" in capacity_input or "\r" in capacity_input:
+        capacity_input = DEFAULT_CAPACITY_INPUT
+
+    env = {
+        "PATH": os.environ.get("PATH", ""),
+        "HOME": os.environ.get("HOME", str(Path.home())),
+        "PYTHONUNBUFFERED": "1",
+    }
+    proc = subprocess.Popen(
+        [
+            sys.executable,
+            str(WATCHDOG_SCRIPT),
+            "--session-dir",
+            session_dir,
+            "--task-id",
+            task_id,
+            "--socket",
+            socket_path,
+            "--tmux-session",
+            session,
+            "--startup-timeout",
+            positive_env("CODEX_DISPATCH_STARTUP_TIMEOUT", "120"),
+            "--heartbeat-timeout",
+            positive_env("CODEX_DISPATCH_HEARTBEAT_TIMEOUT", "900"),
+            "--worker-missing-grace",
+            positive_env("CODEX_DISPATCH_WORKER_MISSING_GRACE", "30"),
+            "--capacity-retries",
+            nonnegative_env("CODEX_DISPATCH_CAPACITY_RETRIES", "3"),
+            "--capacity-delay-s",
+            positive_env("CODEX_DISPATCH_CAPACITY_DELAY_S", "30"),
+            "--capacity-max-delay-s",
+            positive_env("CODEX_DISPATCH_CAPACITY_MAX_DELAY_S", "300"),
+            "--capacity-input",
+            capacity_input,
+            "--capacity-response-timeout-s",
+            positive_env("CODEX_DISPATCH_CAPACITY_RESPONSE_TIMEOUT_S", "30"),
+            "--interval",
+            positive_env("CODEX_DISPATCH_WATCHDOG_INTERVAL", "15"),
+        ],
+        stdin=subprocess.DEVNULL,
+        stdout=log_handle,
+        stderr=subprocess.STDOUT,
+        start_new_session=True,
+        close_fds=True,
+        env=env,
+    )
+    log_handle.close()
+    _update_task_state(watchdog_pid=proc.pid, watchdog_log=str(log_path))
+    return proc.pid
 
 
 def compact_tmux_prompt(prompt: str | None) -> str | None:
@@ -354,13 +626,27 @@ def run_tmux(args: argparse.Namespace) -> int:
     else:
         subprocess.check_call(tmux_cmd(socket_path, "new", "-d", "-s", session, "-n", "shell"))
 
+    _update_task_state(
+        status="starting",
+        lifecycle_stage="worker_starting",
+        tmux_session=session,
+        tmux_socket=socket_path,
+        startup_started_at=_now_iso(),
+    )
+    watchdog_pid = start_watchdog(socket_path, session)
+    if watchdog_pid:
+        print(f"Started dispatch watchdog: pid={watchdog_pid}", flush=True)
+
     # Start session self-destruct timer (independent process group)
     session_ttl = int(os.environ.get("SESSION_TTL", "43200"))  # default 12 hours
-    subprocess.Popen(
-        ["setsid", "bash", "-c",
-         f"sleep {session_ttl} && tmux -S {shlex.quote(socket_path)} kill-session -t {shlex.quote(session)} 2>/dev/null"],
-        stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
-    )
+    if session_ttl > 0:
+        subprocess.Popen(
+            ["setsid", "bash", "-c",
+             f"sleep {session_ttl} && tmux -S {shlex.quote(socket_path)} kill-session -t {shlex.quote(session)} 2>/dev/null"],
+            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+        )
+    else:
+        print("Session self-destruct timer disabled (SESSION_TTL<=0)", flush=True)
 
     # Inject API config at tmux session level first, then shell as backup.
     # This matches coding-agent and reduces timing issues for spawned shell processes.
@@ -411,6 +697,7 @@ def run_tmux(args: argparse.Namespace) -> int:
     cmd_parts = [
         args.codex_bin,
         "--no-daemon",
+        *codex_update_check_args(args),
         *codex_model_args(args),
         "-C",
         cwd,
@@ -423,31 +710,105 @@ def run_tmux(args: argparse.Namespace) -> int:
             cmd_parts += ["-s", args.sandbox]
 
     launch = f"cd {shlex.quote(cwd)} && " + " ".join(shlex.quote(p) for p in cmd_parts)
-    subprocess.check_call(tmux_cmd(socket_path, "send-keys", "-t", target, "-l", "--", launch))
-    subprocess.check_call(tmux_cmd(socket_path, "send-keys", "-t", target, "Enter"))
+    startup_error = ""
+    update_restart_attempted = False
 
-    if tmux_wait_for_any_text(
-        socket_path,
-        target,
-        patterns=["Try new model", "Use existing model"],
-        timeout_s=5,
-        poll_s=0.3,
-    ):
-        subprocess.check_call(tmux_cmd(socket_path, "send-keys", "-t", target, "Down"))
-        time.sleep(0.2)
+    for launch_attempt in range(2):
+        subprocess.check_call(tmux_cmd(socket_path, "send-keys", "-t", target, "-l", "--", launch))
         subprocess.check_call(tmux_cmd(socket_path, "send-keys", "-t", target, "Enter"))
-        time.sleep(1.0)
 
-    if prompt:
-        tmux_wait_for_any_text(
-            socket_path,
-            target,
-            patterns=["OpenAI Codex", "Tip:", "›", ">"],
-            timeout_s=20,
-            poll_s=0.4,
+        ready = wait_for_codex_ready(socket_path, target, timeout_s=25, poll_s=0.4)
+        if ready.get("reason") == "codex_requested_restart_after_update":
+            if launch_attempt == 0:
+                update_restart_attempted = True
+                _update_task_state(
+                    update_restart_attempted=True,
+                    update_restart_at=_now_iso(),
+                    last_health_event="codex_requested_restart_after_update",
+                )
+                print("Codex requested a restart after an update; retrying once with startup updates disabled.", flush=True)
+                time.sleep(0.8)
+                continue
+            startup_error = "Codex requested restart after update twice"
+            break
+
+        if not ready.get("ready"):
+            startup_error = str(ready.get("reason") or "codex_startup_gate_failed")
+            break
+
+        worker = ready.get("worker")
+        worker_pid = worker[0] if isinstance(worker, tuple) else None
+        _update_task_state(
+            status="starting",
+            lifecycle_stage="worker_started",
+            worker_pid=worker_pid,
+            worker_started_at=_now_iso(),
+            last_heartbeat_at=_now_iso(),
+            update_restart_attempted=update_restart_attempted,
         )
-        time.sleep(0.2)
-        tmux_paste_prompt(socket_path, target, prompt)
+
+        try:
+            snapshot = tmux_capture(socket_path, target, lines=160)
+        except subprocess.CalledProcessError:
+            snapshot = ""
+        if "Try new model" in snapshot or "Use existing model" in snapshot:
+            subprocess.check_call(tmux_cmd(socket_path, "send-keys", "-t", target, "Down"))
+            time.sleep(0.2)
+            subprocess.check_call(tmux_cmd(socket_path, "send-keys", "-t", target, "Enter"))
+            time.sleep(1.0)
+            ready_after_choice = wait_for_codex_ready(socket_path, target, timeout_s=20, poll_s=0.4)
+            if not ready_after_choice.get("ready"):
+                startup_error = str(ready_after_choice.get("reason") or "codex_model_selection_failed")
+                break
+            worker = ready_after_choice.get("worker")
+            worker_pid = worker[0] if isinstance(worker, tuple) else worker_pid
+
+        if prompt:
+            time.sleep(0.2)
+            tmux_paste_prompt(socket_path, target, prompt)
+            time.sleep(1.0)
+            try:
+                post_prompt_snapshot = tmux_capture(socket_path, target, lines=180)
+            except subprocess.CalledProcessError:
+                post_prompt_snapshot = ""
+            live_worker = find_codex_worker(socket_path, target)
+            if live_worker is None:
+                if has_update_marker(post_prompt_snapshot):
+                    startup_error = "Codex exited after startup update while submitting prompt"
+                else:
+                    startup_error = "Codex worker disappeared after prompt submission"
+                break
+            worker_pid = live_worker[0]
+            _update_task_state(
+                status="running",
+                lifecycle_stage="business_started",
+                worker_pid=worker_pid,
+                business_started_at=_now_iso(),
+                last_heartbeat_at=_now_iso(),
+                update_restart_attempted=update_restart_attempted,
+            )
+        else:
+            _update_task_state(
+                status="running",
+                lifecycle_stage="worker_started",
+                worker_pid=worker_pid,
+                last_heartbeat_at=_now_iso(),
+                update_restart_attempted=update_restart_attempted,
+            )
+        break
+    else:
+        startup_error = "codex_startup_gate_exhausted"
+
+    if startup_error:
+        _update_task_state(
+            status="failed",
+            lifecycle_stage="startup_failed",
+            failure_reason=startup_error,
+            completed_at=_now_iso(),
+            last_health_event=startup_error,
+        )
+        print(f"Codex startup health gate failed: {startup_error}", file=sys.stderr, flush=True)
+        return STARTUP_GATE_EXIT_CODE
 
     print(f"Started codex-agent in tmux session: {session}")
     print(f"To monitor: tmux -S {shlex.quote(socket_path)} attach -t {shlex.quote(session)}")
@@ -471,6 +832,11 @@ def main() -> int:
     ap.add_argument("--mode", choices=["headless", "tmux"], default="headless")
     ap.add_argument("--codex-bin", default=DEFAULT_CODEX)
     ap.add_argument("--model", default="", help="Model override; omit to use Codex default config")
+    ap.add_argument(
+        "--allow-update-check",
+        action="store_true",
+        help="Allow Codex startup update checks (maintenance/smoke-test escape hatch)",
+    )
     ap.add_argument("--cwd", help="Working directory")
     ap.add_argument("--sandbox", default=None, help="Sandbox mode (read-only/workspace-write/danger-full-access)")
     ap.add_argument("--skip-git-repo-check", action="store_true")

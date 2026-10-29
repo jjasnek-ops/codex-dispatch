@@ -218,6 +218,33 @@ Codex 单任务派发入口。课堂里最优先讲这个文件。
 - 设置 hook 需要的 `CODING_AGENT_*` 环境变量；
 - 调用 `codex_run.py` 把 Codex 启动进 tmux；
 - headless 模式下直接调用 `hooks/notify-agi.sh` 写结果；
+
+## 任务启动门禁与故障恢复
+
+派发状态不是“tmux 存在就算运行”。单任务状态按以下生命周期记录：
+
+```text
+starting → worker_started → business_started/running → completed
+                                         └──────────→ failed
+```
+
+- 派发默认向 Codex 注入 `-c check_for_update_on_startup=false`，避免业务任务启动时修改 Codex 安装。
+- 如果旧版 Codex 仍输出“Please restart Codex”，只允许在同一 tmux 会话中自动重启一次；第二次失败即记录 `startup_failed`。
+- 启动成功必须同时看到 Codex 子进程和 Codex UI，提交 prompt 后再次确认 worker 仍存在；shell/tmux 存在本身不能放行。
+- 每个 tmux 任务会启动 `watchdog.py`，记录心跳、worker PID、pane 活跃度；tmux 消失或 worker 长时间消失会标记失败并通知，但不会盲目重跑建站、广告或部署任务。
+- watchdog 默认启动门限为 120 秒、worker 消失宽限 30 秒、静默告警 900 秒、检查间隔 15 秒；可用 `CODEX_DISPATCH_STARTUP_TIMEOUT`、`CODEX_DISPATCH_WORKER_MISSING_GRACE`、`CODEX_DISPATCH_HEARTBEAT_TIMEOUT` 和 `CODEX_DISPATCH_WATCHDOG_INTERVAL` 调整。
+- watchdog 识别到明确容量提示后，在原 tmux 会话发送明确续跑指令并等待真实接受证据；仅 `send-keys` 成功不计为恢复。每轮默认最多 3 次发送，不换模型、不重启 worker、不重跑业务阶段；耗尽后 `waiting_input` 并告警。具体响应窗口与退避规则见下文。可用 `CODEX_DISPATCH_CAPACITY_RETRIES`、`CODEX_DISPATCH_CAPACITY_DELAY_S`、`CODEX_DISPATCH_CAPACITY_MAX_DELAY_S`、`CODEX_DISPATCH_CAPACITY_RESPONSE_TIMEOUT_S` 和 `CODEX_DISPATCH_CAPACITY_INPUT` 调整。
+- stdout/stderr、watchdog 日志和状态文件按会话隔离，避免并发任务覆盖诊断证据。
+- 仅维护/烟测场景可显式给 `codex_run.py` 传 `--allow-update-check`；生产派发不应使用该逃生参数。
+
+关键证据文件：
+
+**【修改位置 1】容量重试按发送前基线确认：新出现的 Codex 工作标记或发送后的真实工具回合回执才算接受。错误文字消失、输入回显、旧 Working 的计时变化不算；面板变化不能提前结束退避。最多发送 3 次（发送失败/无响应也占发送预算，但不是成功次数），每次等待响应默认 30 秒，再按 30/60 秒退避后发下一次；第三次仍失败即 waiting_input。不会切模型或自动重启旧 watchdog。修改只由后续新启动的 watchdog 加载。**
+
+- `data/sessions/<tmux-session>/task-meta.json`
+- `data/sessions/<tmux-session>/task-output.txt`
+- `data/sessions/<tmux-session>/watchdog.log`
+- `data/tasks/<task-id>.json`
 - tmux 模式下依赖 Codex notify hook 完成结果回写。
 
 ## `codex_run.py`

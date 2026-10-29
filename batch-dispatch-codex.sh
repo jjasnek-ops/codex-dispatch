@@ -201,12 +201,12 @@ wait_for_task_completion() {
             local tmux_session=$(jq -r '.tmux_session // ""' "$task_file" 2>/dev/null || echo "")
             local tmux_socket=$(jq -r '.tmux_socket // ""' "$task_file" 2>/dev/null || echo "")
 
-            if [ "$status" = "running" ] && [ "$run_mode" = "tmux" ] \
+            if { [ "$status" = "starting" ] || [ "$status" = "running" ]; } && [ "$run_mode" = "tmux" ] \
                 && [ -n "$tmux_session" ] && [ -n "$tmux_socket" ]; then
                 if ! tmux -S "$tmux_socket" has-session -t "$tmux_session" 2>/dev/null; then
                     local orphaned_at="$(date -Iseconds)"
                     jq --arg ts "$orphaned_at" \
-                        '. + {status:"failed", exit_code:1, failure_reason:"tmux session ended before completion hook", completed_at:$ts}' \
+                        '. + {status:"failed", lifecycle_stage:"worker_failed", exit_code:1, failure_reason:"tmux session ended before completion hook", completed_at:$ts}' \
                         "$task_file" > "${task_file}.tmp" 2>/dev/null && mv "${task_file}.tmp" "$task_file"
                     WAIT_RESULT="failed"
                     echo "Task orphaned: $task_id (tmux session ended before completion hook)" >&2
@@ -288,8 +288,12 @@ $prompt"
         echo "Chaining from previous task (${#LAST_PROMPT} chars)"
     fi
 
-    # 构建 dispatch 参数
-    local dispatch_args=(-p "$full_prompt" -n "$task_name" -w "$WORKDIR" --tmux-session "$TMUX_SESSION")
+    # 每个 Part 使用独立 tmux session，避免 Hook 的 session 元数据和
+    # current-task-id.txt 在串行任务之间互相覆盖；父级名称仍保留为批次标识。
+    local child_tmux_session="${TMUX_SESSION}-p${index}"
+    local dispatch_args=(-p "$full_prompt" -n "$task_name" -w "$WORKDIR" --tmux-session "$child_tmux_session")
+
+    echo "   Child tmux session: $child_tmux_session"
 
     if [ -n "$FEISHU_TARGET" ]; then
         dispatch_args+=(--target "$FEISHU_TARGET")
