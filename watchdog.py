@@ -33,7 +33,7 @@ from codex_run import (
 
 SCRIPT_DIR = Path(__file__).parent
 NOTIFY_SCRIPT = SCRIPT_DIR / "hooks" / "notify-agi.sh"
-TERMINAL_STATUSES = {"done", "failed", "error", "waiting_input"}
+TERMINAL_STATUSES = {"done", "failed", "error"}
 CAPACITY_MARKER = "model is at capacity"
 CAPACITY_RETRY_MARKER = "try a different model"
 DEFAULT_CAPACITY_INPUT = (
@@ -99,8 +99,9 @@ def notify_failure(session_dir: Path, task_id: str, reason: str) -> None:
         pass
 
 
-def notify_warning(meta: dict, reason: str) -> None:
-    path = task_state.enqueue(meta, "health-" + snapshot_digest(reason),
+def notify_warning(session_dir: Path, task_id: str, reason: str) -> None:
+    meta = task_state.current(session_dir, task_id)
+    path = task_state.queue_notification(session_dir, task_id, "health-" + snapshot_digest(reason),
         f"Codex 任务健康告警：{meta.get('task_name', 'unknown')}\n{reason}", root=SCRIPT_DIR)
     task_state.schedule_delivery(path)
 
@@ -168,7 +169,7 @@ def handle_capacity(
     snapshot: str,
     current_time: float | None = None,
 ) -> tuple[dict[str, object], bool, str | None]:
-    """Return metadata updates, terminal flag, and an optional warning.
+    """Return metadata updates, needs-input flag, and an optional warning.
 
     Send an explicit continuation prompt, then wait for a real Codex work
     marker before treating the retry as accepted. A successful tmux write is
@@ -322,23 +323,25 @@ def check_once(args: argparse.Namespace, state: dict) -> tuple[dict, bool]:
 
 def _check_once_locked(args: argparse.Namespace, state: dict) -> tuple[dict, bool]:
     session_dir = Path(args.session_dir)
-    meta = load_meta(session_dir)
+    meta = task_state.reconcile(session_dir, args.task_id, root=SCRIPT_DIR)
     if not meta:
         print("watchdog: task metadata unavailable", file=sys.stderr, flush=True)
         return state, True
 
     status = str(meta.get("status") or "")
+    for receipt in task_state.pending_receipts(meta, root=SCRIPT_DIR):
+        task_state.schedule_delivery(receipt)
     if status in TERMINAL_STATUSES:
         # Hook may have committed the terminal result before its delivery worker
         # could start. The durable receipt is idempotent and owns its budget.
-        task_state.schedule_delivery(meta.get("notification_receipt"))
         return meta, True
 
     target = f"{args.tmux_session}:0.0"
     current_time = time.time()
     if meta.get("session_deadline_epoch") and current_time >= meta["session_deadline_epoch"] and not meta.get("deadline_notified"):
+        # Persist the idempotent intent before suppressing later checks.
+        notify_warning(session_dir, args.task_id, "Task deadline reached; session retained for authorized recovery (not killed)")
         update_state(session_dir, args.task_id, deadline_notified=True)
-        notify_warning(meta, "Task deadline reached; session retained for authorized recovery (not killed)")
     started_at = epoch(str(meta.get("startup_started_at") or meta.get("started_at") or ""))
 
     if not has_session(args.socket, args.tmux_session):
@@ -354,6 +357,12 @@ def _check_once_locked(args: argparse.Namespace, state: dict) -> tuple[dict, boo
         )
         notify_failure(session_dir, args.task_id, reason)
         return load_meta(session_dir), True
+
+    if status == "waiting_input":
+        # Park without sending input or spending retry budget. Keep the same
+        # singleton alive so a later running Hook resumes health monitoring.
+        update_state(session_dir, args.task_id, watchdog_last_check_at=now_iso(), health_status="waiting_input")
+        return load_meta(session_dir), False
 
     worker = find_codex_worker(args.socket, target)
     if worker:
@@ -382,7 +391,7 @@ def _check_once_locked(args: argparse.Namespace, state: dict) -> tuple[dict, boo
             updates["lifecycle_stage"] = "worker_started"
 
         if meta.get("capacity_retry_pending") or meta.get("capacity_retry_count") or model_capacity_blocked(snapshot):
-            capacity_updates, capacity_done, capacity_warning = handle_capacity(
+            capacity_updates, _capacity_done, capacity_warning = handle_capacity(
                 args, meta, target, snapshot, current_time=current_time
             )
             updates.update(capacity_updates)
@@ -390,9 +399,9 @@ def _check_once_locked(args: argparse.Namespace, state: dict) -> tuple[dict, boo
             if event and event != meta.get("last_health_event"):
                 print(f"watchdog: {event}", flush=True)
             if capacity_warning:
-                notify_warning(meta, capacity_warning)
+                notify_warning(session_dir, args.task_id, capacity_warning)
             update_state(session_dir, args.task_id, **updates)
-            return load_meta(session_dir), capacity_done
+            return load_meta(session_dir), False
 
         elif current_time - last_change >= args.heartbeat_timeout:
             if meta.get("health_status") != "stalled":
@@ -400,7 +409,7 @@ def _check_once_locked(args: argparse.Namespace, state: dict) -> tuple[dict, boo
                 updates["stalled_since"] = meta.get("stalled_since") or now_iso()
                 reason = f"tmux pane unchanged for at least {args.heartbeat_timeout}s"
                 print(f"watchdog: {reason}", flush=True)
-                notify_warning(meta, reason)
+                notify_warning(session_dir, args.task_id, reason)
         update_state(session_dir, args.task_id, **updates)
         return load_meta(session_dir), False
 

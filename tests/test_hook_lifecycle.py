@@ -78,6 +78,15 @@ def exercise_lifecycle(root):
             state = json.loads(path.read_text())
             assert state["status"] == "running" and "completed_at" not in state and "exit_code" not in state
         result["all_progress_mirrors_consistent"] = True
+        hook(json.dumps({"status": "waiting_input", "summary": "fixture needs input"}))
+        time.sleep(1.2)
+        result["watchdog_retained_during_waiting_input"] = watcher.poll() is None
+        assert result["watchdog_retained_during_waiting_input"], "waiting_input lost its watchdog"
+        assert read()["status"] == "waiting_input", "parked watchdog must not resume the task itself"
+        hook(json.dumps({"status": "running", "summary": "fixture authorized continuation"}))
+        time.sleep(1.2)
+        result["watchdog_active_after_authorized_resume"] = watcher.poll() is None
+        assert result["watchdog_active_after_authorized_resume"] and read()["status"] == "running"
         hook(json.dumps({"title": "final", "ok": True, "status": "success_with_warnings"}, indent=2))
         stdout, stderr = watcher.communicate(timeout=5)
         result["watchdog_exit_code"] = watcher.returncode

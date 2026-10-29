@@ -1,5 +1,7 @@
 # Codex Dispatch
 
+**【修改位置 2】本次修改说明：配置不再写全局文件，提示词使用独立命名 buffer；交互 resume、等待输入后的持续监控、通知意图与状态镜像的崩溃恢复已补齐。详见 SKILL.md 的状态与通知边界。**
+
 `codex-dispatch/` 是独立的 Codex 任务派发目录。它负责把任务送进 Codex tmux 会话，让学生可以在 tmux 或 Claw Remote 面板里同步观察执行现场。
 
 ## 目录结构
@@ -38,51 +40,11 @@ codex --version
 codex
 ```
 
-配置 Codex hook：
-
-Codex tmux 任务能启动和观察，不依赖 hook；但要让任务完成后自动写入 `data/tasks/<TASK_ID>.json`、更新 `data/latest.json`、发送飞书完成通知，就需要提前在 Codex 配置文件里配置 notify hook。
-
-Codex 配置文件是：
-
-```text
-~/.codex/config.toml
-```
-
-如果文件不存在，先创建：
-
-```bash
-mkdir -p ~/.codex
-touch ~/.codex/config.toml
-```
-
-然后把下面这一行合并进 `~/.codex/config.toml`：
-
-```toml
-notify = ["/root/.openclaw/skills/codex-dispatch/hooks/notify-agi.sh"]
-```
-
-注意：
-
-- 不要覆盖学生原来 `~/.codex/config.toml` 里的模型、账号、sandbox 等配置，只增加或合并 `notify`。
-- 如果学生把项目安装到别的位置，要把上面路径改成自己机器上的真实 `hooks/notify-agi.sh` 路径。
-- 如果配置文件里已经有 `notify = [...]`，就把 `/root/.openclaw/skills/codex-dispatch/hooks/notify-agi.sh` 加进原数组，不要重复写两个 `notify` 字段。
-
-例如已经有其他 notify 命令时，可以整理成：
-
-```toml
-notify = [
-  "/root/.openclaw/skills/codex-dispatch/hooks/notify-agi.sh"
-]
-```
-
-验证：
+**【修改位置 3】Codex hook 使用本次进程的 `-c notify=[...]` 参数，真实路径由运行器位置确定；项目 trust 也使用进程级覆盖。无需创建或修改 `~/.codex/config.toml`，已有全局配置保持原样。Hook 会记录任务状态和通知意图，outbox 只在发送成功后登记送达。严格 Part 通过最后的 `-c notify=[]` 禁用父任务回调。启动前只需检查 Hook 可执行：**
 
 ```bash
 test -x /root/.openclaw/skills/codex-dispatch/hooks/notify-agi.sh
-grep -n 'notify' ~/.codex/config.toml
 ```
-
-课堂建议把这一步放在启动 dispatch 前完成。`codex_run.py` 也会尝试检查 notify 配置，但手动配置更适合教学演示：学生能明确知道“Codex 完成时为什么会回写任务状态和发完成通知”。
 
 默认不需要 `.env`。不传 `--model` 时，脚本直接使用学生自己 `~/.codex/config.toml` / Codex 登录态里的默认模型配置；只有显式传 `--model` 时，才临时覆盖本次任务模型。
 

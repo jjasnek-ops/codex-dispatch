@@ -12,6 +12,8 @@ allowed-tools: Bash(codex-dispatch:*)
 
 # Codex Dispatch Skill
 
+**【修改位置 4】本次修改说明：提示词改用独立命名缓冲区；trust/notify 改用进程参数；交互模式真正传递 resume；等待输入时保留 watchdog；通知意图与状态共同提交，终态检查恢复镜像和 outbox。**
+
 **【修改位置 3】本次统一任务代次隔离、状态事务和逐任务通知 outbox；同名派发不再替换活跃会话，TTL 到期只告警，不按名字清理。已有进程不热更新，也不会自动取消旧进程已安排的计时器。**
 
 本 skill 是给后续 agent 用的调用规范。OpenClaw agent 只负责任务发放，真正执行由 Codex 在 tmux 会话中完成。
@@ -26,6 +28,9 @@ allowed-tools: Bash(codex-dispatch:*)
 
 ### 状态与通知边界
 
+- **【修改位置 5】每次粘贴使用唯一命名 tmux buffer，加载、粘贴、失败清理均指向该 buffer；不使用或清空其他任务的默认缓冲区。运行器通过本次 Codex 的 `-c` 参数设置项目 trust 和 notify，不修改全局 `config.toml`，默认模型/登录态仍沿用原配置。严格 Part 的 `notify=[]` 覆盖继续有效。**
+- **【修改位置 6】所有通知意图先记录在 `task-meta.json.notification_events`；终态写入自动同时记录终态通知意图，再生成镜像和 outbox。重启后的 watchdog 即使遇到终态，也先补齐镜像及缺失的发送回执，再交接未完成的通知。既有回执的 attempts/delivered 状态不重置；未提交的事件不能提前发送。**
+- **【修改位置 7】`waiting_input` 不是 watchdog 的退出条件：保留同一 singleton，暂停自动输入及容量重试，不消耗新预算；真实 Hook 回到 running 后继续健康检查。已有旧 watchdog 不会热加载或自动重启。交互 `--resume <session-id/name>` 明确执行 `codex resume <session-id/name>`，不落入选择器，也不覆盖仍存在的同名 tmux。**
 - `task_state.py` 是 runner、Hook、watchdog 的唯一状态写入口。`task-meta.json` 为权威，镜像带同一 revision；事务锁覆盖重新读取、更新、提交与镜像。进程中断后的镜像在下一次事务中修复，不把多文件更新声称为同一瞬间原子可见。
 - task_id、Codex thread 和 tmux 实例身份必须匹配；旧回调、旧 watchdog 不得操作同名新任务。done/failed/error 为不可逆终态，迟到进度不能重新打开任务。重复 turn-id 幂等忽略。
 - 同名活跃/等待任务或仍存在的 tmux 会话会拒绝重新派发；授权续跑应使用原任务会话和检查点。不要为绕过拒绝而删除元数据、清理旧会话或生成新 ID。headless 任务使用各自的状态目录。

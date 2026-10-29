@@ -19,6 +19,7 @@ import sys
 import shutil
 import tempfile
 import time
+import uuid
 from pathlib import Path
 # Also imported by the strict Part driver via spec_from_file_location.
 if str(Path(__file__).resolve().parent) not in sys.path:
@@ -49,10 +50,14 @@ def codex_model_args(args: argparse.Namespace) -> list[str]:
     return ["-m", model] if model else []
 
 
-def _ensure_directory_trusted(cwd: str | None) -> None:
-    """Auto-add cwd (and its git root) to ~/.codex/config.toml as trusted."""
+def _ensure_directory_trusted(cwd: str | None) -> list[str]:
+    """Return invocation-local trust overrides; never edit shared config.
+
+    Kept under the existing name for the strict Part driver's preflight API.
+    Each business command must include the returned arguments itself.
+    """
     if not cwd:
-        return
+        return []
     paths_to_trust: list[str] = [os.path.abspath(cwd)]
     # Also trust git repo root if inside a git repo
     try:
@@ -65,19 +70,8 @@ def _ensure_directory_trusted(cwd: str | None) -> None:
     except (subprocess.CalledProcessError, FileNotFoundError):
         pass
 
-    if not CODEX_CONFIG_FILE.exists():
-        return
-
-    content = CODEX_CONFIG_FILE.read_text()
-    added = False
-    for p in paths_to_trust:
-        section_key = f'[projects."{p}"]'
-        if section_key not in content:
-            content = content.rstrip("\n") + f"\n\n{section_key}\ntrust_level = \"trusted\"\n"
-            added = True
-    if added:
-        CODEX_CONFIG_FILE.write_text(content)
-        print(f"Auto-trusted directories in config.toml: {paths_to_trust}", flush=True)
+    return [arg for path in paths_to_trust
+            for arg in ("-c", f'projects.{json.dumps(path, ensure_ascii=False)}.trust_level="trusted"')]
 
 
 NOTIFY_SCRIPT = str(SCRIPT_DIR / "hooks" / "notify-agi.sh")
@@ -134,35 +128,9 @@ def codex_update_check_args(args: argparse.Namespace) -> list[str]:
     return ["-c", "check_for_update_on_startup=false"]
 
 
-def _ensure_notify_configured() -> None:
-    """Ensure notify hook is configured in ~/.codex/config.toml.
-
-    The notify line can be accidentally lost when config.toml is edited
-    (e.g., model migration, manual edits). This function restores it.
-    """
-    if not CODEX_CONFIG_FILE.exists():
-        return
-
-    content = CODEX_CONFIG_FILE.read_text()
-    notify_line = f'notify = ["{NOTIFY_SCRIPT}"]'
-
-    if notify_line in content:
-        return
-
-    if re.search(r"^notify\s*=", content, re.MULTILINE):
-        return  # Has some notify config, don't override
-
-    lines = content.split("\n")
-    insert_idx = len(lines)
-    for i, line in enumerate(lines):
-        stripped = line.strip()
-        if stripped.startswith("[") and not stripped.startswith("[notice"):
-            insert_idx = i
-            break
-
-    lines.insert(insert_idx, notify_line)
-    CODEX_CONFIG_FILE.write_text("\n".join(lines))
-    print(f"Restored notify config in config.toml: {NOTIFY_SCRIPT}", flush=True)
+def _ensure_notify_configured() -> list[str]:
+    """Scope the dispatch Hook to this invocation, preserving the global file."""
+    return ["-c", "notify=" + json.dumps([NOTIFY_SCRIPT])]
 
 
 def _read_codex_api_key() -> str:
@@ -199,6 +167,8 @@ def build_headless_cmd(args: argparse.Namespace) -> list[str]:
         args.codex_bin,
         "--no-daemon",
         *codex_update_check_args(args),
+        *_ensure_directory_trusted(args.cwd),
+        *_ensure_notify_configured(),
         "exec",
         *codex_model_args(args),
     ]
@@ -233,6 +203,24 @@ def build_headless_cmd(args: argparse.Namespace) -> list[str]:
     return cmd
 
 
+def build_tmux_cmd(args: argparse.Namespace) -> list[str]:
+    cmd = [args.codex_bin, "--no-daemon"]
+    resume = getattr(args, "resume", None)
+    if resume:
+        if not isinstance(resume, str) or not resume.strip() or resume.startswith("-"):
+            raise ValueError("invalid_resume_session")
+        cmd += ["resume", resume]
+    cmd += [*codex_update_check_args(args), *_ensure_directory_trusted(args.cwd),
+            *_ensure_notify_configured(), *codex_model_args(args), "-C", args.cwd or os.getcwd()]
+    if args.yolo:
+        cmd.append("--dangerously-bypass-approvals-and-sandbox")
+    else:
+        cmd += ["-a", "never"]
+        if args.sandbox:
+            cmd += ["-s", args.sandbox]
+    return cmd
+
+
 def extract_thread_id_from_jsonl(output: str) -> str | None:
     """Extract thread_id from JSONL output."""
     for line in output.splitlines():
@@ -250,8 +238,6 @@ def extract_thread_id_from_jsonl(output: str) -> str | None:
 
 
 def run_headless(args: argparse.Namespace) -> int:
-    _ensure_directory_trusted(args.cwd)
-    _ensure_notify_configured()
     cmd = build_headless_cmd(args)
     print(f"Running: {' '.join(shlex.quote(c) for c in cmd)}", flush=True)
 
@@ -562,10 +548,10 @@ def tmux_paste_prompt(socket_path: str, target: str, prompt: str) -> None:
     with tempfile.NamedTemporaryFile(mode="w", delete=False, suffix=".txt", encoding="utf-8", dir=SCRIPT_DIR / "tmp") as f:
         f.write(prompt)
         temp_file = f.name
-
+    buffer_name = "dispatch-" + uuid.uuid4().hex
     try:
-        subprocess.check_call(tmux_cmd(socket_path, "load-buffer", temp_file))
-        subprocess.check_call(tmux_cmd(socket_path, "paste-buffer", "-d", "-t", target))
+        subprocess.check_call(tmux_cmd(socket_path, "load-buffer", "-b", buffer_name, temp_file))
+        subprocess.check_call(tmux_cmd(socket_path, "paste-buffer", "-b", buffer_name, "-d", "-t", target))
         paste_wait_s = min(1.5, 0.35 + (len(prompt) / 6000.0))
         time.sleep(paste_wait_s)
         subprocess.check_call(tmux_cmd(socket_path, "send-keys", "-t", target, "Enter"))
@@ -578,7 +564,11 @@ def tmux_paste_prompt(socket_path: str, target: str, prompt: str) -> None:
         except subprocess.CalledProcessError:
             pass
     finally:
-        Path(temp_file).unlink(missing_ok=True)
+        try:
+            subprocess.run(tmux_cmd(socket_path, "delete-buffer", "-b", buffer_name),
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
+        finally:
+            Path(temp_file).unlink(missing_ok=True)
 
 
 def run_tmux(args: argparse.Namespace) -> int:
@@ -607,6 +597,7 @@ def run_tmux(args: argparse.Namespace) -> int:
     if session_exists:
         print("tmux session exists; resume original task instead of redispatch", file=sys.stderr)
         return STARTUP_GATE_EXIT_CODE
+    cmd_parts = build_tmux_cmd(args)
     generation = os.environ.get("CODING_AGENT_TASK_ID", "")
     session_dir = os.environ.get("CODING_AGENT_SESSION_DIR", "")
     with task_state.lock(session_dir) if session_dir else nullcontext():
@@ -624,8 +615,6 @@ def run_tmux(args: argparse.Namespace) -> int:
         _update_task_state(status="starting", lifecycle_stage="worker_starting", tmux_session=session,
                            tmux_socket=socket_path, tmux_instance=instance, tmux_generation=generation,
                            startup_started_at=_now_iso())
-    _ensure_directory_trusted(args.cwd)
-    _ensure_notify_configured()
     watchdog_pid = start_watchdog(socket_path, session)
     if watchdog_pid:
         print(f"Started dispatch watchdog: pid={watchdog_pid}", flush=True)
@@ -681,21 +670,6 @@ def run_tmux(args: argparse.Namespace) -> int:
 
     # Build interactive codex command (no 'exec' subcommand = interactive TUI mode)
     # Note: -a never and --dangerously-bypass-approvals-and-sandbox are mutually exclusive
-    cmd_parts = [
-        args.codex_bin,
-        "--no-daemon",
-        *codex_update_check_args(args),
-        *codex_model_args(args),
-        "-C",
-        cwd,
-    ]
-    if args.yolo:
-        cmd_parts += ["--dangerously-bypass-approvals-and-sandbox"]
-    else:
-        cmd_parts += ["-a", "never"]
-        if args.sandbox:
-            cmd_parts += ["-s", args.sandbox]
-
     launch = f"cd {shlex.quote(cwd)} && " + " ".join(shlex.quote(p) for p in cmd_parts)
     startup_error = ""
     update_restart_attempted = False

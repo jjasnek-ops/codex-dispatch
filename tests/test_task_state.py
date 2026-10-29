@@ -147,6 +147,127 @@ class TaskStateTests(unittest.TestCase):
         self.assertEqual(self.meta()["status"], "done")
         self.assertEqual(S.read(self.root / "data/tasks/new-task.json"), self.meta())
 
+    def watchdog_args(self):
+        return argparse.Namespace(session_dir=str(self.session), task_id="new-task", socket="unused",
+            tmux_session="fixture", heartbeat_timeout=900, worker_missing_grace=30, startup_timeout=120)
+
+    def test_watchdog_recovers_terminal_mirrors_without_another_hook(self):
+        with patch.object(S, "mirror", side_effect=OSError("canonical commit survived")):
+            with self.assertRaises(OSError):
+                S.update(self.session, "new-task", {"status": "done"})
+        self.assertEqual("running", S.read(self.root / "data/tasks/new-task.json")["status"])
+        with patch.object(watchdog, "SCRIPT_DIR", self.root), patch.object(watchdog, "has_session", return_value=False):
+            _, stopped = watchdog.check_once(self.watchdog_args(), {})
+        self.assertTrue(stopped)
+        self.assertEqual(self.meta(), S.read(self.root / "data/tasks/new-task.json"))
+        self.assertEqual(self.meta(), S.read(self.root / "data/latest.json"))
+
+    def test_failure_commit_before_hook_is_deliverable_after_restart(self):
+        S.update(self.session, "new-task", {"feishu_target": "fixture-no-network"})
+        with patch.object(watchdog, "SCRIPT_DIR", self.root), patch.object(watchdog, "has_session", return_value=False):
+            with patch.object(watchdog, "notify_failure", side_effect=RuntimeError("process death before Hook")):
+                with self.assertRaises(RuntimeError):
+                    watchdog.check_once(self.watchdog_args(), {})
+            self.assertEqual("failed", self.meta()["status"])
+            with patch.object(S, "schedule_delivery") as deliver:
+                _, stopped = watchdog.check_once(self.watchdog_args(), {})
+                self.assertTrue(stopped)
+                deliver.assert_called_once()
+                receipt = Path(deliver.call_args.args[0])
+        self.assertEqual("pending", S.read(receipt)["state"])
+        self.assertIn("tmux session ended", S.read(receipt)["message"])
+
+    def test_committed_intent_survives_outbox_write_crash_and_preserves_budget(self):
+        S.update(self.session, "new-task", {"feishu_target": "fixture-no-network"})
+        original = S.atomic_json
+        def write(path, value):
+            if Path(path).parent.name == "outbox":
+                raise OSError("interrupted outbox materialization")
+            original(path, value)
+        with patch.object(S, "atomic_json", side_effect=write):
+            with self.assertRaises(OSError):
+                S.hook(self.session, "new-task", "done", "fixture final", 0)
+        self.assertEqual("done", self.meta()["status"])
+        self.assertTrue(self.meta()["notification_events"])
+        self.assertFalse(Path(self.meta()["notification_receipt"]).exists())
+        with patch.object(watchdog, "SCRIPT_DIR", self.root), patch.object(watchdog, "has_session", return_value=False), \
+                patch.object(S, "schedule_delivery") as deliver:
+            watchdog.check_once(self.watchdog_args(), {})
+            deliver.assert_called_once()
+        path = Path(self.meta()["notification_receipt"])
+        item = S.read(path)
+        item.update(attempts=2, state="pending", last_exit_code=71)
+        S.atomic_json(path, item)
+        S.reconcile(self.session, "new-task")
+        self.assertEqual(item, S.read(path))
+        with patch.object(S.subprocess, "run", return_value=subprocess.CompletedProcess([], 71)) as send:
+            S.drain(path)
+        self.assertEqual(1, send.call_count)
+        self.assertEqual(3, S.read(path)["attempts"])
+        self.assertEqual([], S.pending_receipts(self.meta()))
+
+    def test_uncommitted_terminal_intent_never_creates_a_sendable_receipt(self):
+        S.update(self.session, "new-task", {"feishu_target": "fixture-no-network"})
+        original = S.atomic_json
+        def write(path, value):
+            if Path(path).name == "task-meta.json":
+                raise OSError("canonical commit failed")
+            original(path, value)
+        with patch.object(S, "atomic_json", side_effect=write), self.assertRaises(OSError):
+            S.hook(self.session, "new-task", "done", "never committed", 0)
+        self.assertEqual("running", self.meta()["status"])
+        self.assertEqual([], list((self.root / "data/outbox").glob("*.json")))
+
+    def test_startup_and_health_intents_are_reconciled_without_budget_reset(self):
+        S.update(self.session, "new-task", {"feishu_target": "fixture-no-network"})
+        with patch.object(S, "reconcile_derived", side_effect=OSError("crash after state")):
+            with self.assertRaises(OSError):
+                S.queue_notification(self.session, "new-task", "startup", "fixture startup")
+        self.assertEqual("running", self.meta()["status"])
+        S.reconcile(self.session, "new-task")
+        paths = S.pending_receipts(self.meta())
+        self.assertEqual(1, len(paths))
+        with patch.object(S.subprocess, "run", return_value=subprocess.CompletedProcess([], 0)):
+            S.drain(paths[0])
+        S.queue_notification(self.session, "new-task", "startup", "duplicate")
+        self.assertEqual([], S.pending_receipts(self.meta()))
+        self.assertEqual("fixture startup", S.read(paths[0])["message"])
+        self.assertEqual(1, S.read(paths[0])["attempts"])
+
+    def test_waiting_input_parks_watchdog_and_running_hook_resumes_checks(self):
+        S.update(self.session, "new-task", {"capacity_retry_count": 3})
+        S.hook(self.session, "new-task", "waiting_input", "need user", 0, "thread", "turn-1")
+        with patch.object(watchdog, "SCRIPT_DIR", self.root), patch.object(watchdog, "has_session", return_value=True), \
+                patch.object(watchdog, "find_codex_worker", return_value=None) as worker, \
+                patch.object(watchdog, "send_capacity_input") as send:
+            _, stopped = watchdog.check_once(self.watchdog_args(), {})
+            self.assertFalse(stopped)
+            worker.assert_not_called()
+            send.assert_not_called()
+            self.assertEqual(3, self.meta()["capacity_retry_count"])
+            S.hook(self.session, "new-task", "running", "user resumed", 0, "thread", "turn-2")
+            _, stopped = watchdog.check_once(self.watchdog_args(), {})
+            self.assertFalse(stopped)
+            worker.assert_called_once()
+
+    def test_deadline_crash_cannot_set_suppression_before_durable_notification(self):
+        S.update(self.session, "new-task", {"session_deadline_epoch": time.time() - 1,
+            "started_at": S.now(), "feishu_target": "fixture-no-network"})
+        original = watchdog.update_state
+        def update(session, task, **updates):
+            if updates.get("deadline_notified"):
+                raise RuntimeError("process died before suppression flag")
+            return original(session, task, **updates)
+        with patch.object(watchdog, "SCRIPT_DIR", self.root), patch.object(watchdog, "has_session", return_value=True), \
+                patch.object(watchdog, "find_codex_worker", return_value=None), patch.object(S, "schedule_delivery"):
+            with patch.object(watchdog, "update_state", side_effect=update), self.assertRaises(RuntimeError):
+                watchdog.check_once(self.watchdog_args(), {})
+            self.assertEqual(1, len(self.meta()["notification_events"]))
+            self.assertFalse(self.meta().get("deadline_notified"))
+            watchdog.check_once(self.watchdog_args(), {})
+        self.assertTrue(self.meta()["deadline_notified"])
+        self.assertEqual(1, len(self.meta()["notification_events"]))
+
     def test_old_watchdog_does_not_inspect_or_send_to_new_task(self):
         import argparse
         args = argparse.Namespace(session_dir=str(self.session), task_id="old-task")

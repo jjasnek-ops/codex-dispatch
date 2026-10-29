@@ -12,6 +12,9 @@ import sys
 import tempfile
 import time
 import unittest
+import shlex
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from unittest.mock import patch
 
@@ -59,6 +62,109 @@ class DispatchHealthTests(unittest.TestCase):
     def capacity_args(self):
         return argparse.Namespace(socket="unused.sock", capacity_retries=3, capacity_delay_s=30,
             capacity_max_delay_s=300, capacity_response_timeout_s=10, capacity_input=watchdog.DEFAULT_CAPACITY_INPUT)
+
+    def test_real_parallel_prompt_pastes_use_task_local_named_buffers(self):
+        with tempfile.TemporaryDirectory(prefix="paste-") as directory:
+            root = Path(directory)
+            socket = str(root / "test.sock")
+            raw = subprocess.check_call
+            a_loaded, b_loaded, a_pasted = (threading.Event() for _ in range(3))
+            errors = []
+            def call(command, *args, **kwargs):
+                role = threading.current_thread().name
+                if "load-buffer" in command:
+                    if role == "B":
+                        self.assertTrue(a_loaded.wait(5))
+                    code = raw(command, *args, **kwargs)
+                    if role == "A":
+                        a_loaded.set()
+                        self.assertTrue(b_loaded.wait(5))
+                    else:
+                        b_loaded.set()
+                    return code
+                if "paste-buffer" in command:
+                    if role == "B":
+                        self.assertTrue(a_pasted.wait(5))
+                    code = raw(command, *args, **kwargs)
+                    if role == "A":
+                        a_pasted.set()
+                    return code
+                return raw(command, *args, **kwargs)
+            def send(role):
+                try:
+                    codex_run.tmux_paste_prompt(socket, role + ":0.0", "FIXTURE_TASK_" + role)
+                except BaseException as error:
+                    errors.append(repr(error))
+            try:
+                for role in ("A", "B"):
+                    raw(["tmux", "-f", "/dev/null", "-S", socket, "new-session", "-d", "-s", role,
+                         "cat > " + shlex.quote(str(root / (role + ".input")))])
+                raw(["tmux", "-S", socket, "set-buffer", "-b", "unrelated", "preserve me"])
+                with patch.object(codex_run.subprocess, "check_call", side_effect=call):
+                    threads = [threading.Thread(name=role, target=send, args=(role,)) for role in ("A", "B")]
+                    for thread in threads:
+                        thread.start()
+                    for thread in threads:
+                        thread.join(10)
+                        self.assertFalse(thread.is_alive())
+                self.assertEqual([], errors)
+                for role in ("A", "B"):
+                    self.assertEqual("FIXTURE_TASK_" + role, (root / (role + ".input")).read_text().strip())
+                buffers = subprocess.check_output(["tmux", "-S", socket, "list-buffers", "-F", "#{buffer_name}"], text=True)
+                self.assertEqual(["unrelated"], buffers.splitlines())
+            finally:
+                subprocess.run(["tmux", "-S", socket, "kill-server"], capture_output=True)
+
+    def test_failed_paste_cleans_only_its_named_buffer_and_temporary_file(self):
+        with tempfile.TemporaryDirectory(prefix="paste-fail-") as directory:
+            root = Path(directory)
+            calls = []
+            def call(command):
+                calls.append(command)
+                if "paste-buffer" in command:
+                    raise subprocess.CalledProcessError(1, command)
+                return 0
+            with patch.object(codex_run, "SCRIPT_DIR", root), \
+                    patch.object(codex_run.subprocess, "check_call", side_effect=call), \
+                    patch.object(codex_run.subprocess, "run") as cleanup:
+                with self.assertRaises(subprocess.CalledProcessError):
+                    codex_run.tmux_paste_prompt("unused", "fixture:0.0", "fixture")
+            loaded = calls[0][calls[0].index("-b") + 1]
+            self.assertEqual(loaded, cleanup.call_args.args[0][-1])
+            self.assertIn("delete-buffer", cleanup.call_args.args[0])
+            self.assertEqual([], list((root / "tmp").iterdir()))
+
+    def test_interactive_resume_is_passed_to_codex_without_picker(self):
+        args = argparse.Namespace(codex_bin="fixture-codex", cwd=str(ROOT), resume="existing-thread",
+            model="", yolo=True, sandbox=None, allow_update_check=False)
+        command = codex_run.build_tmux_cmd(args)
+        index = command.index("resume")
+        self.assertEqual("existing-thread", command[index + 1])
+        self.assertNotIn("--last", command)
+        self.assertIn("--no-daemon", command)
+        self.assertNotIn("-m", command)
+        args.resume = None
+        self.assertNotIn("resume", codex_run.build_tmux_cmd(args))
+
+    def test_parallel_runtime_configuration_never_writes_shared_config(self):
+        with tempfile.TemporaryDirectory(prefix="config-") as directory:
+            root = Path(directory)
+            config = root / "config.toml"
+            original = b'model = "fixture"\n# preserve comments and custom settings\n'
+            config.write_bytes(original)
+            projects = [root / ("project-" + str(i)) for i in range(8)]
+            for project in projects:
+                project.mkdir()
+            def build(project):
+                args = argparse.Namespace(codex_bin="fixture-codex", cwd=str(project), resume=None,
+                    model="", yolo=True, sandbox=None, allow_update_check=False)
+                return codex_run.build_tmux_cmd(args)
+            with patch.object(codex_run, "CODEX_CONFIG_FILE", config), ThreadPoolExecutor(max_workers=8) as pool:
+                commands = list(pool.map(build, projects))
+            self.assertEqual(original, config.read_bytes())
+            for project, command in zip(projects, commands):
+                self.assertIn('projects.' + json.dumps(str(project)) + '.trust_level="trusted"', command)
+                self.assertIn("notify=" + json.dumps([codex_run.NOTIFY_SCRIPT]), command)
 
     def hook_states(self, output, *, interactive=True, exit_code=0):
         with tempfile.TemporaryDirectory(prefix="hook-state-") as directory:

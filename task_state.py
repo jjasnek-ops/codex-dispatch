@@ -102,11 +102,84 @@ def mirror(session_dir, data, root=None):
     atomic_json(root / "data/latest.json", data)
 
 
+def notification_key(task_id, kind, target):
+    return hashlib.sha256(json.dumps([task_id, kind, "feishu", target]).encode()).hexdigest()
+
+
+def remember_notification(data, kind, message, root=None):
+    """Record an immutable intent in the canonical transaction before I/O."""
+    if not data.get("feishu_target"):
+        return None
+    key = notification_key(data["task_id"], kind, data["feishu_target"])
+    intents = data.setdefault("notification_events", {})
+    if key not in intents:
+        intents[key] = {"task_id": data["task_id"], "event": kind, "channel": "feishu",
+            "target": data["feishu_target"], "message": message, "state": "pending", "attempts": 0,
+            "created_at": now(), "max_attempts": 3, "next_attempt_at": 0}
+    return Path(root or ROOT) / "data/outbox" / (key + ".json")
+
+
+def ensure_terminal_intent(data, root=None):
+    if data.get("status") not in TERMINAL or not data.get("feishu_target"):
+        return False
+    kind = "terminal-" + data["status"]
+    key = notification_key(data["task_id"], kind, data["feishu_target"])
+    changed = key not in data.get("notification_events", {})
+    detail = str(data.get("failure_reason") or data.get("output") or data.get("last_health_event")
+                 or "Terminal state recorded; no additional output available")
+    receipt = remember_notification(data, kind,
+        f"Codex 任务{'完成' if data['status'] == 'done' else '失败'}：{data.get('task_name', data['task_id'])}\n{detail[-1000:]}", root)
+    changed = changed or data.get("notification_receipt") != str(receipt)
+    data["notification_receipt"] = str(receipt)
+    return changed
+
+
+def reconcile_derived(session_dir, data, root=None):
+    """Rebuild mirrors/outbox from committed intents, never reset delivery budgets."""
+    mirror(session_dir, data, root)
+    for key, item in data.get("notification_events", {}).items():
+        if key != notification_key(item["task_id"], item["event"], item["target"]):
+            raise ValueError("notification_identity_mismatch")
+        path = Path(root or ROOT) / "data/outbox" / (key + ".json")
+        if not path.exists():
+            atomic_json(path, item)
+
+
+def reconcile(session_dir, task_id, *, root=None):
+    with lock(session_dir):
+        data = current(session_dir, task_id)
+        # Also closes legacy terminal records committed before an outbox existed.
+        if ensure_terminal_intent(data, root):
+            return commit(session_dir, data, root)
+        reconcile_derived(session_dir, data, root)
+        return data
+
+
+def pending_receipts(data, *, root=None):
+    result = []
+    for key in data.get("notification_events", {}):
+        path = Path(root or ROOT) / "data/outbox" / (key + ".json")
+        item = read(path)
+        if item["state"] != "delivered" and item["attempts"] < item["max_attempts"]:
+            result.append(path)
+    return result
+
+
+def queue_notification(session_dir, task_id, kind, message, *, root=None):
+    with lock(session_dir):
+        data = current(session_dir, task_id)
+        receipt = remember_notification(data, kind, message, root)
+        if receipt:
+            commit(session_dir, data, root)
+        return receipt
+
+
 def commit(session_dir, data, root=None):
+    ensure_terminal_intent(data, root)
     data["revision"] = int(data.get("revision", 0)) + 1
     data["timestamp"] = now()
     atomic_json(Path(session_dir) / "task-meta.json", data)
-    mirror(session_dir, data, root)
+    reconcile_derived(session_dir, data, root)
     return data
 
 
@@ -115,8 +188,7 @@ def update(session_dir, task_id, updates, *, root=None):
         data = current(session_dir, task_id)
         # Re-read inside the transaction; never copy a caller's stale snapshot.
         if data.get("status") in TERMINAL:
-            mirror(session_dir, data, root)
-            return data
+            return reconcile(session_dir, task_id, root=root)
         for key in ("task_id", "revision", "started_at", "tmux_instance", "tmux_generation"):
             if key in updates and key in data and updates[key] != data[key]:
                 raise StaleTask("immutable_task_identity")
@@ -147,7 +219,7 @@ def enqueue(meta, kind, message, *, root=None):
     if not meta.get("feishu_target"):
         return None
     root = Path(root or ROOT)
-    key = hashlib.sha256(json.dumps([meta["task_id"], kind, "feishu", meta["feishu_target"]]).encode()).hexdigest()
+    key = notification_key(meta["task_id"], kind, meta["feishu_target"])
     path = root / "data/outbox" / (key + ".json")
     if not path.exists():
         atomic_json(path, {"task_id": meta["task_id"], "event": kind, "channel": "feishu",
@@ -208,13 +280,13 @@ def hook(session_dir, task_id, status, output, exit_code, thread_id="", turn_id=
             raise StaleTask("stale_hook_thread")
         seen = meta.get("hook_turn_ids", [])
         if turn_id and turn_id in seen:
-            mirror(session_dir, meta)
+            meta = reconcile(session_dir, task_id)
             return meta, meta.get("notification_receipt")
         if meta.get("status") in TERMINAL:
             # Permit enriching a terminal worker failure with its first Hook,
             # never reopening or changing an already committed terminal result.
             if meta["status"] != status or meta.get("terminal_hook_recorded"):
-                mirror(session_dir, meta)
+                meta = reconcile(session_dir, task_id)
                 return meta, meta.get("notification_receipt")
         meta.update(status=status, output=output, last_turn_completed_at=now(),
                     last_turn_thread_id=thread_id or meta.get("thread_id", ""))
@@ -233,13 +305,8 @@ def hook(session_dir, task_id, status, output, exit_code, thread_id="", turn_id=
                 meta["lifecycle_stage"] = "waiting_input"
             elif meta.get("lifecycle_stage") not in {"dispatch_started", "worker_starting", "worker_started", "business_started"}:
                 meta["lifecycle_stage"] = "business_started"
-        receipt = None
-        if status in TERMINAL:
-            receipt = enqueue(meta, "terminal-" + status,
-                f"Codex 任务{ '完成' if status == 'done' else '失败'}：{meta.get('task_name', task_id)}\n{output[-1000:]}")
-            if receipt:
-                meta["notification_receipt"] = str(receipt)
-        return commit(session_dir, meta), receipt
+        meta = commit(session_dir, meta)
+        return meta, meta.get("notification_receipt") if status in TERMINAL else None
 
 
 def main():
@@ -267,8 +334,7 @@ def main():
                               args.thread_id, args.turn_id)
             schedule_delivery(receipt)
         elif args.action == "notify":
-            with lock(args.session_dir):
-                receipt = enqueue(current(args.session_dir, args.task_id), args.kind, sys.stdin.read())
+            receipt = queue_notification(args.session_dir, args.task_id, args.kind, sys.stdin.read())
             schedule_delivery(receipt)
         return 0
     except StaleTask as exc:
