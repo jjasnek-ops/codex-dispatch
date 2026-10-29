@@ -30,32 +30,19 @@ check_task_completion() {
         return
     fi
 
-    # Read the top-level contract, not a successful child or a quoted prefix.
-    if printf '%s' "$output" | jq -e 'type == "object" and
-        (.ok == false or .status == "failed" or .status == "error" or
-         ((.exit_code | type) == "number" and .exit_code != 0))' >/dev/null 2>&1; then
-        echo "failed"
-        return
-    fi
-    if printf '%s' "$output" | jq -e 'type == "object" and
-        (.status == "waiting_input" or .status == "blocked")' >/dev/null 2>&1; then
-        echo "waiting_input"
-        return
-    fi
-
-    # Interactive notify fires for intermediate tool turns as well. A compact
-    # tool-title payload is progress, not completion of the dispatched task.
-    if [ "$interactive_event" = "1" ] && echo "$output" | grep -Eq '^\{"title"[[:space:]]*:'; then
-        echo "working"
-        return
-    fi
-
-    # Aggregate task results can legitimately contain non-zero exit codes for
-    # skipped/optional child steps.  Prefer an explicit top-level success
-    # contract before scanning the full report for those child exit codes.
-    if printf '%s' "$output" | jq -e 'type == "object" and .ok == true and
-        (.status == "success" or .status == "success_with_warnings")' >/dev/null 2>&1; then
-        echo "done"
+    # A turn completing is not the task completing. Parse exactly one object;
+    # whitespace, key order, titles and nested child outcomes cannot change it.
+    local structured_status
+    if structured_status=$(printf '%s' "$output" | jq -ers --arg interactive "$interactive_event" '
+        if length != 1 or (.[0] | type) != "object" then error("not one object") else .[0] |
+            if .ok == false or .status == "failed" or .status == "error" or
+               ((.exit_code | type) == "number" and .exit_code != 0) then "failed"
+            elif .status == "waiting_input" or .status == "blocked" then "waiting_input"
+            elif .ok == true and (.status == "success" or .status == "success_with_warnings") then "done"
+            elif $interactive == "1" then "working"
+            else "waiting_input" end
+        end' 2>/dev/null); then
+        echo "$structured_status"
         return
     fi
 
@@ -72,17 +59,13 @@ check_task_completion() {
         return
     fi
 
-    if echo "$output" | grep -qE "(任务.*完成|Task completed|Successfully completed|完成标记|✅)"; then
+    # Unknown interactive text (including a substep's checkmark/commit) is only
+    # progress. Headless legacy text still has the real worker exit code above.
+    if [ "$interactive_event" = "1" ]; then
+        echo "working"
+    else
         echo "done"
-        return
     fi
-
-    if echo "$output" | grep -qE "(git commit|Co-Authored-By:)"; then
-        echo "done"
-        return
-    fi
-
-    echo "done"
 }
 
 log "=== notify-agi.sh fired ==="
@@ -187,6 +170,8 @@ if [ "$WRITE_STATUS" = "working" ]; then
             LIFECYCLE_STAGE="business_started"
             ;;
     esac
+elif [ "$WRITE_STATUS" = "waiting_input" ]; then
+    LIFECYCLE_STAGE="waiting_input"
 elif [ "$WRITE_STATUS" != "done" ]; then
     LIFECYCLE_STAGE="worker_failed"
 fi
@@ -195,19 +180,15 @@ if [ "$WRITE_STATUS" = "failed" ] && [ "$EXISTING_LIFECYCLE_STAGE" = "startup_fa
 fi
 
 TASK_FILE="${RESULT_DIR}/tasks/${TASK_ID}.json"
-if [ -f "$TASK_FILE" ]; then
-    jq --arg ts "$DONE_TS" \
-       --arg output "$OUTPUT" \
-       --arg thread_id "${THREAD_ID:-}" \
-       --arg status "$WRITE_STATUS" \
-       --arg exit_code "$EXIT_CODE" \
-       --arg lifecycle_stage "$LIFECYCLE_STAGE" \
-       '. + {status: $status, timestamp: $ts, output: $output, completed_at: $ts, thread_id: $thread_id, exit_code: ($exit_code | tonumber), lifecycle_stage: $lifecycle_stage}' \
-       "$TASK_FILE" > "${TASK_FILE}.tmp" 2>/dev/null && mv "${TASK_FILE}.tmp" "$TASK_FILE"
-else
-    jq -n \
+# Apply the same terminal/nonterminal rules to every state surface. In
+# particular a progress hook must clear stale terminal fields in mirrors too.
+write_hook_state() {
+    local source="$1" target="$2" include_output="$3"
+    [ -f "$source" ] || source=/dev/null
+    jq -n --slurpfile prior "$source" \
         --arg ts "$DONE_TS" \
         --arg output "$OUTPUT" \
+        --argjson include_output "$include_output" \
         --arg task "$TASK_NAME" \
         --arg task_id "$TASK_ID" \
         --arg target "$FEISHU_TARGET" \
@@ -215,36 +196,23 @@ else
         --arg status "$WRITE_STATUS" \
         --arg exit_code "$EXIT_CODE" \
         --arg lifecycle_stage "$LIFECYCLE_STAGE" \
-        '{task_name: $task, task_id: $task_id, feishu_target: $target, timestamp: $ts, output: $output, status: $status, completed_at: $ts, thread_id: $thread_id, exit_code: ($exit_code | tonumber), lifecycle_stage: $lifecycle_stage}' \
-        > "$TASK_FILE" 2>/dev/null
-fi
+        '($prior[0] // {}) + {task_name: $task, task_id: $task_id, feishu_target: $target,
+            timestamp: $ts, status: $status, thread_id: $thread_id, lifecycle_stage: $lifecycle_stage,
+            last_turn_completed_at: $ts, last_turn_thread_id: $thread_id}
+        | if $include_output then . + {output: $output} else . end
+        | if $status == "done" or $status == "failed" then
+            . + {completed_at: $ts, exit_code: ($exit_code | tonumber)}
+          else del(.completed_at, .exit_code) end' \
+        > "${target}.tmp" && mv "${target}.tmp" "$target"
+}
+write_hook_state "$TASK_FILE" "$TASK_FILE" true || exit 1
 log "Wrote tasks/${TASK_ID}.json (status=$WRITE_STATUS)"
 
-jq -n \
-    --arg ts "$DONE_TS" \
-    --arg output "$OUTPUT" \
-    --arg task "$TASK_NAME" \
-    --arg task_id "$TASK_ID" \
-    --arg target "$FEISHU_TARGET" \
-    --arg status "$WRITE_STATUS" \
-    --arg exit_code "$EXIT_CODE" \
-    --arg lifecycle_stage "$LIFECYCLE_STAGE" \
-    '{task_name: $task, task_id: $task_id, feishu_target: $target, timestamp: $ts, output: $output, status: $status, exit_code: ($exit_code | tonumber), lifecycle_stage: $lifecycle_stage}' \
-    > "${RESULT_DIR}/latest.json" 2>/dev/null
+write_hook_state /dev/null "${RESULT_DIR}/latest.json" true || exit 1
 log "Wrote latest.json"
 
 if [ -n "$META_FILE" ] && [ -f "$META_FILE" ]; then
-    if [ "$COMPLETION_STATUS" = "working" ]; then
-        jq --arg ts "$DONE_TS" --arg status "$WRITE_STATUS" \
-           --arg lifecycle_stage "$LIFECYCLE_STAGE" --arg thread_id "${THREAD_ID:-}" \
-           '. + {last_turn_completed_at: $ts, last_turn_thread_id: $thread_id, status: $status, lifecycle_stage: $lifecycle_stage} | del(.completed_at, .exit_code)' \
-            "$META_FILE" > "${META_FILE}.tmp" 2>/dev/null && mv "${META_FILE}.tmp" "$META_FILE"
-    else
-        jq --arg ts "$DONE_TS" --arg status "$WRITE_STATUS" --arg exit_code "$EXIT_CODE" \
-           --arg lifecycle_stage "$LIFECYCLE_STAGE" \
-           '. + {completed_at: $ts, status: $status, exit_code: ($exit_code | tonumber), lifecycle_stage: $lifecycle_stage}' \
-            "$META_FILE" > "${META_FILE}.tmp" 2>/dev/null && mv "${META_FILE}.tmp" "$META_FILE"
-    fi
+    write_hook_state "$META_FILE" "$META_FILE" false || exit 1
 fi
 
 if [ -z "$TASK_COMPLETED_AT" ]; then

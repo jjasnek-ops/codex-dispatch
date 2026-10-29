@@ -60,6 +60,113 @@ class DispatchHealthTests(unittest.TestCase):
         return argparse.Namespace(socket="unused.sock", capacity_retries=3, capacity_delay_s=30,
             capacity_max_delay_s=300, capacity_response_timeout_s=10, capacity_input=watchdog.DEFAULT_CAPACITY_INPUT)
 
+    def hook_states(self, output, *, interactive=True, exit_code=0):
+        with tempfile.TemporaryDirectory(prefix="hook-state-") as directory:
+            root = Path(directory)
+            runtime = self.isolated_runtime(root)
+            session = root / "session"
+            session.mkdir()
+            meta = session / "task-meta.json"
+            stale = {"task_id": "state-test", "status": "running", "feishu_target": "",
+                     "lifecycle_stage": "business_started", "completed_at": "old", "exit_code": 0}
+            meta.write_text(json.dumps(stale))
+            task = runtime / "data/tasks/state-test.json"
+            task.parent.mkdir(parents=True)
+            task.write_text(json.dumps(stale))
+            env = {**os.environ, "CODING_AGENT_TASK_ID": "state-test",
+                   "CODING_AGENT_SESSION_DIR": str(session), "CODEX_EXIT_CODE": str(exit_code)}
+            command = ["bash", str(runtime / "hooks/notify-agi.sh")]
+            if interactive:
+                command.append(json.dumps({"type": "agent-turn-complete", "thread-id": "fixture",
+                    "turn-id": "new-turn", "last-assistant-message": output}))
+            else:
+                last = root / "last.txt"
+                last.write_text(output)
+                env["CODEX_LAST_MSG_FILE"] = str(last)
+            subprocess.run(command, env=env, check=True, capture_output=True)
+            return [json.loads(p.read_text()) for p in (meta, task, runtime / "data/latest.json")]
+
+    def test_hook_progress_formats_never_become_task_completion(self):
+        outputs = ['{"title":"Part 2 complete"}', '{\n  "title": "checking Part 2"\n}',
+            ' \n {"detail":"✅ complete", "title":"checking"}',
+            '{"status":"running", "ok":true, "child":{"status":"success"}}',
+            '{"status":"in_progress"}', '{"status":"retrying"}', '{}',
+            '✅ Part 2 completed; git commit created', 'Working on the next step',
+            '{"ok":true,"status":"success"}\n{"status":"running"}']
+        for output in outputs:
+            with self.subTest(output=output):
+                for state in self.hook_states(output):
+                    self.assertEqual(state["status"], "running")
+                    self.assertEqual(state["lifecycle_stage"], "business_started")
+                    self.assertNotIn("completed_at", state)
+                    self.assertNotIn("exit_code", state)
+                    self.assertTrue(state["last_turn_completed_at"])
+
+    def test_hook_title_does_not_override_explicit_terminal_status(self):
+        for status in ("success", "success_with_warnings"):
+            with self.subTest(status=status):
+                output = json.dumps({"title": "final", "ok": True, "status": status,
+                                     "child": {"exit_code": 1}}, indent=2)
+                for state in self.hook_states(output):
+                    self.assertEqual(state["status"], "done")
+                    self.assertEqual(state["lifecycle_stage"], "completed")
+                    self.assertTrue(state["completed_at"])
+                    self.assertEqual(state["exit_code"], 0)
+
+    def test_hook_waiting_input_is_not_completed_in_any_mirror(self):
+        for state in self.hook_states('{"status":"waiting_input","title":"need user"}'):
+            self.assertEqual(state["status"], "waiting_input")
+            self.assertNotIn("completed_at", state)
+            self.assertNotIn("exit_code", state)
+
+    def test_hook_nonzero_exit_overrides_success_and_headless_progress_needs_input(self):
+        for state in self.hook_states('{"ok":true,"status":"success"}', exit_code=1):
+            self.assertEqual(state["status"], "failed")
+            self.assertEqual(state["exit_code"], 1)
+        for state in self.hook_states('{"status":"running"}', interactive=False):
+            self.assertEqual(state["status"], "waiting_input")
+            self.assertNotIn("completed_at", state)
+        for state in self.hook_states('Legacy headless result', interactive=False):
+            self.assertEqual(state["status"], "done")
+
+    def test_dispatch_emits_terminal_contract_and_hook_accepts_fixture_result(self):
+        with tempfile.TemporaryDirectory(prefix="dispatch-contract-") as directory:
+            root = Path(directory)
+            runtime = self.isolated_runtime(root)
+            shutil.copy2(ROOT / "dispatch-codex.sh", runtime / "dispatch-codex.sh")
+            # Replace only the external worker in this isolated copy. Execute
+            # the current dispatch and Hook, never a real Codex/API/login.
+            (runtime / "codex_run.py").write_text('''import json, os, sys
+from pathlib import Path
+prompt = Path(os.environ["CODING_AGENT_PROMPT_FILE"]).read_text()
+assert "status=running" in prompt and "单个顶层 JSON" in prompt
+assert "success_with_warnings" in prompt and "status=waiting_input" in prompt
+output = Path(sys.argv[sys.argv.index("--output-file") + 1])
+output.write_text(json.dumps({"ok": True, "status": "success", "summary": "fixture only"}))
+''')
+            # Both notification paths use timeout; this shim records and blocks
+            # outbound calls without modifying the machine's OpenClaw binary.
+            bin_dir = root / "bin"
+            bin_dir.mkdir()
+            shim = bin_dir / "timeout"
+            shim.write_text('#!/bin/sh\n[ "$2" = "/usr/bin/openclaw" ] || exit 95\nprintf "blocked\\n" >> "$FIXTURE_NOTIFY_LOG"\n')
+            shim.chmod(0o755)
+            config = root / "dispatch-config.json"
+            config.write_text('{}')
+            notice_log = root / "blocked-notifications.log"
+            result = subprocess.run(["bash", str(runtime / "dispatch-codex.sh"), "--no-tmux",
+                "--target", "fixture-no-network", "-w", str(root), "-p", "fixture original request"],
+                env={**os.environ, "PATH": str(bin_dir) + os.pathsep + os.environ["PATH"],
+                     "DISPATCH_CONFIG": str(config), "CDP_PORT": "", "FIXTURE_NOTIFY_LOG": str(notice_log)},
+                capture_output=True, text=True, timeout=10)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            meta = json.loads((runtime / "data/task-meta.json").read_text())
+            self.assertEqual(meta["status"], "done")
+            self.assertIn("fixture original request", Path(meta["prompt_file"]).read_text())
+            for path in (runtime / "data/tasks" / (meta["task_id"] + ".json"), runtime / "data/latest.json"):
+                self.assertEqual(json.loads(path.read_text())["status"], "done")
+            self.assertEqual(len(notice_log.read_text().splitlines()), 2)
+
     def test_capacity_empty_error_disappearance_and_echo_are_not_acknowledgements(self):
         args = self.capacity_args()
         blocked = "■ Selected model is at capacity. Please try a different model."

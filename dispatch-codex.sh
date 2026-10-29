@@ -131,6 +131,7 @@ PROMPT="${PROMPT}
 - 如需修改代码，先运行任务要求的验证；只提交本次任务实际改动，使用 main 分支和 origin/main，不提交凭证、tmp、生成产物或无关用户改动。
 - 任务要求发送 Feishu 摘要时发送一次真实摘要；通知失败必须保留真实退出码和错误，不得用 \`|| true\` 隐藏。
 - 长操作放到任务要求的后台会话；不得结束其他任务的浏览器、tmux 或登录态。
+- 中途回合结束不代表整个任务完成。中途结构化进度用 status=running；最终回复使用单个顶层 JSON（不加 Markdown 围栏），包含 summary 和真实证据：成功用 ok=true、status=success 或 success_with_warnings；失败用 ok=false、status=failed；等用户输入用 status=waiting_input。子步骤成功、title、提交记录和勾号不能代替整任务终态。
 "
 
 # ---- 0. Resolve runtime mode ----

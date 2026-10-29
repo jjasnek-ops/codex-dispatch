@@ -146,6 +146,8 @@ tmux watchdog 对明确的 `Selected model is at capacity` + `Please try a diffe
 
 **【修改位置 1】容量确认必须相对发送前基线：新工作标记或发送后的真实工具回合回执才算接受；错误消失、输入回显、旧 Working 计时变化都不算。面板变化不能跳过退避。默认最多 3 次发送，每次等响应 30 秒；前两次无响应后分别等 30/60 秒再发，第三次仍失败则 waiting_input。发送失败也占有界发送预算，但绝不是成功次数。既有 watchdog 不会热加载或被自动重启。**
 
+**【修改位置 2】交互式 Hook 的回合结束不是任务结束：换行 JSON、title、status=running 和未知进度文本均保持 running，不因子步骤成功、提交或勾号退出 watchdog。最终回复必须是单个顶层 JSON（无 Markdown 围栏），含 summary；ok=true 且 status=success/success_with_warnings 才确认成功，顶层失败优先。派发器已注入该输出契约。session、tasks 和 latest 三份记录使用同一状态规则；running/waiting_input 不保留 completed_at 或 exit_code。headless 已退出进程的非终态 JSON 进入 waiting_input，旧文本输出仍按实际退出码处理。**
+
 - Codex dispatch：`/root/.openclaw/skills/codex-dispatch/dispatch-codex.sh`
 - Codex runner：`/root/.openclaw/skills/codex-dispatch/codex_run.py`
 - Codex hook：`/root/.openclaw/skills/codex-dispatch/hooks/notify-agi.sh`
